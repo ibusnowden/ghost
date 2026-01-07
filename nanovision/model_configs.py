@@ -101,3 +101,51 @@ def get_nanochat_original_config(vocab_size=50304, sequence_len=2048, depth=20):
         rope_theta=10000.0,
         attention_bias=False,
     )
+
+
+# Vision-Language Model configurations
+def get_vlm_1_5b_config(vocab_size=151646, sequence_len=32768, vision_encoder="siglip_vit_l14"):
+    """
+    Vision-Language Model based on Qwen2.5-1.5B + Vision Encoder
+    - Same LLM architecture as Qwen2.5-1.5B
+    - Vision encoder: SigLIP ViT-L/14 (default) or CLIP ViT-L/14
+    - 64 vision tokens resampled via Perceiver
+    - 2-layer MLP projector
+    """
+    config = get_qwen25_1_5b_config(vocab_size=vocab_size, sequence_len=sequence_len)
+
+    # Add vision configuration
+    config.vision_encoder_name = vision_encoder
+    config.vision_encoder_trainable = False  # Frozen vision encoder
+    config.vision_image_size = 336  # Higher res for better quality
+    config.vision_num_tokens = 64
+    config.vision_resampler_mode = "perceiver"
+    config.vision_resampler_depth = 2
+    config.vision_resampler_heads = 8
+    config.vision_proj_hidden = 2048
+    config.vision_proj_dropout = 0.0
+
+    return config
+
+
+def get_vlm_small_config(vocab_size=50304, sequence_len=2048, depth=20, vision_encoder="siglip_vit_l14"):
+    """
+    Small Vision-Language Model for budget training
+    - Same LLM architecture as Qwen2.5-small
+    - Vision encoder: SigLIP ViT-L/14 (default)
+    - 64 vision tokens
+    """
+    config = get_qwen25_small_config(vocab_size=vocab_size, sequence_len=sequence_len, depth=depth)
+
+    # Add vision configuration
+    config.vision_encoder_name = vision_encoder
+    config.vision_encoder_trainable = False
+    config.vision_image_size = 336
+    config.vision_num_tokens = 64
+    config.vision_resampler_mode = "perceiver"
+    config.vision_resampler_depth = 2
+    config.vision_resampler_heads = 8
+    config.vision_proj_hidden = 2048
+    config.vision_proj_dropout = 0.0
+
+    return config

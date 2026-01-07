@@ -40,6 +40,16 @@ from tasks.mbpp import MBPP
 from tasks.humaneval import HumanEval
 from tasks.dolci_think import DolciThink
 
+# Vision support
+try:
+    from PIL import Image
+    from nanochat.vision.transforms import get_vision_transforms
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    Image = None
+    get_vision_transforms = None
+
 # -----------------------------------------------------------------------------
 # Thought/Answer splitting for logging
 
@@ -418,12 +428,41 @@ def _run_pass_at_1(eval_items):
     total = 0
     correct = 0
     eval_model.eval()
+
+    # Initialize vision transforms if available
+    vision_transforms = None
+    if VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+        try:
+            vlm_config = orig_model.config
+            vision_transforms = get_vision_transforms(
+                encoder_name=vlm_config.vision_encoder_name,
+                image_size=vlm_config.vision_image_size,
+                is_train=False,
+            )
+        except:
+            pass
+
     with torch.no_grad():
         for idx, (name, task, conversation) in enumerate(eval_items):
+            # Process vision if image is present
+            vision_embeds = None
+            if vision_transforms is not None and isinstance(conversation, dict):
+                image = conversation.get("image")
+                if image is not None:
+                    try:
+                        if not isinstance(image, Image.Image):
+                            image = Image.open(image).convert("RGB")
+                        image_tensor = vision_transforms(image).unsqueeze(0).to(device)
+                        vision_embeds = orig_model.encode_vision(image_tensor)
+                    except Exception as e:
+                        print0(f"Warning: Failed to process eval image: {e}")
+                        vision_embeds = None
+
             tokens = tokenizer.render_for_completion(conversation)
             prefix_length = len(tokens)
             seed = (eval_seed * 1000003 + idx) & 0x7FFFFFFF
             with autocast_ctx:
+                # Note: engine.generate_batch will be updated in Phase 6 to accept vision_embeds
                 generated, _ = engine.generate_batch(
                     tokens,
                     num_samples=1,
@@ -431,6 +470,7 @@ def _run_pass_at_1(eval_items):
                     temperature=eval_temperature,
                     top_k=eval_top_k_val,
                     seed=seed,
+                    # vision_embeds=vision_embeds,  # Will be enabled in Phase 6
                 )
             generated_tokens = generated[0][prefix_length:]
             generated_text = tokenizer.decode(generated_tokens)
@@ -489,11 +529,41 @@ def get_batch():
 
     rollout_counter = 0
     dynamic_sampling_attempts = 0
+
+    # Initialize vision transforms if available
+    vision_transforms = None
+    if VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+        try:
+            vlm_config = orig_model.config
+            vision_transforms = get_vision_transforms(
+                encoder_name=vlm_config.vision_encoder_name,
+                image_size=vlm_config.vision_image_size,
+                is_train=False,
+            )
+        except:
+            pass
+
     while True:
         task_name, task, conversation = task_sampler.sample()
         if format_hint_mode == "eval":
             hint = _get_eval_format_hint(task_name, conversation)
             conversation = _append_format_hint(conversation, hint)
+
+        # Process vision if image is present
+        vision_embeds = None
+        if vision_transforms is not None and isinstance(conversation, dict):
+            image = conversation.get("image")
+            if image is not None:
+                try:
+                    if not isinstance(image, Image.Image):
+                        image = Image.open(image).convert("RGB")
+                    image_tensor = vision_transforms(image).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        vision_embeds = orig_model.encode_vision(image_tensor)
+                except Exception as e:
+                    print0(f"Warning: Failed to process image: {e}")
+                    vision_embeds = None
+
         if max_prompt_tokens and max_prompt_tokens > 0:
             tokens = tokenizer.render_for_completion(conversation, max_prompt_tokens=max_prompt_tokens)
         else:
@@ -634,11 +704,17 @@ def get_batch():
         if prefix_length > 0:
             assert mask_ids[:, :prefix_length].sum().item() == 0, "Prompt tokens should be masked out"
 
+        # Replicate vision_embeds for batch if present
+        batch_vision_embeds = None
+        if vision_embeds is not None:
+            batch_size = inputs.shape[0]
+            batch_vision_embeds = vision_embeds.repeat(batch_size, 1, 1)
+
         # Compute logp_old from current policy BEFORE any updates (for GRPO clipped objective)
         eval_model.eval()
         with torch.no_grad():
             with autocast_ctx:
-                logp_old = -eval_model(inputs, targets, loss_reduction='none').view_as(inputs)
+                logp_old = -eval_model(inputs, targets, vision_embeds=batch_vision_embeds, loss_reduction='none').view_as(inputs)
         valid_mask = (targets >= 0).float()
         token_counts = valid_mask.sum(dim=1).clamp(min=1.0)
         logp_old_sum = (logp_old * valid_mask).sum(dim=1)
@@ -657,7 +733,7 @@ def get_batch():
         entropy_sum = (-logp_old * valid_mask).sum()
         entropy_count = valid_mask.sum()
 
-        yield (task_name, generated_token_sequences, inputs, targets, rewards_tensor, advantages,
+        yield (task_name, generated_token_sequences, inputs, targets, batch_vision_embeds, rewards_tensor, advantages,
                raw_rewards_tensor, thought_lens_tensor, answer_lens_tensor, response_lens_tensor,
                length_penalties_tensor, logp_old, logp_old_mean, valid_mask, entropy_sum, entropy_count)
 
@@ -828,7 +904,7 @@ for step in range(num_steps):
     # =========================================================================
     collected_batches = []
     for example_step in range(examples_per_rank):
-        (task_name, sequences_all, inputs_all, targets_all, rewards_all, advantages_all,
+        (task_name, sequences_all, inputs_all, targets_all, batch_vision_embeds, rewards_all, advantages_all,
          raw_rewards_all, thought_lens_all, answer_lens_all, response_lens_all,
          length_penalties_all, logp_old_all, logp_old_mean_all, valid_mask_all,
          entropy_sum_all, entropy_count_all) = next(batch_iterator)
@@ -838,6 +914,7 @@ for step in range(num_steps):
             'sequences_all': sequences_all,
             'inputs_all': inputs_all,
             'targets_all': targets_all,
+            'batch_vision_embeds': batch_vision_embeds,
             'rewards_all': rewards_all,
             'advantages_all': advantages_all,
             'raw_rewards_all': raw_rewards_all,
@@ -879,10 +956,12 @@ for step in range(num_steps):
     flat_advantages = []
     flat_logp_old = []
     flat_valid_mask = []
+    flat_vision_embeds = []
     for batch in collected_batches:
         sequences_all = batch['sequences_all']
         inputs_all = batch['inputs_all']
         targets_all = batch['targets_all']
+        batch_vision_embeds = batch['batch_vision_embeds']
         advantages_all = batch['advantages_all']
         logp_old_all = batch['logp_old_all']
         valid_mask_all = batch['valid_mask_all']
@@ -896,6 +975,11 @@ for step in range(num_steps):
             flat_advantages.append(advantages_all[idx])
             flat_logp_old.append(logp_old_all[idx, :token_len])
             flat_valid_mask.append(valid_mask_all[idx, :token_len])
+            # Vision embeds: store per-sample (None if no vision)
+            if batch_vision_embeds is not None:
+                flat_vision_embeds.append(batch_vision_embeds[idx])
+            else:
+                flat_vision_embeds.append(None)
 
     total_samples = len(flat_inputs)
     if total_samples == 0:
@@ -932,6 +1016,21 @@ for step in range(num_steps):
             logp_old_all = torch.stack([pad_1d(flat_logp_old[i], 0.0) for i in mb_indices], dim=0)
             valid_mask_all = torch.stack([pad_1d(flat_valid_mask[i], 0.0) for i in mb_indices], dim=0)
             advantages_all = torch.stack([flat_advantages[i] for i in mb_indices], dim=0)
+
+            # Gather vision embeds for minibatch
+            vision_embeds_all = None
+            if any(flat_vision_embeds[i] is not None for i in mb_indices):
+                vision_embeds_list = []
+                for i in mb_indices:
+                    if flat_vision_embeds[i] is not None:
+                        vision_embeds_list.append(flat_vision_embeds[i])
+                    else:
+                        # If some samples don't have vision, this is an error
+                        # For now, skip mixed batches - all samples should have same vision status
+                        vision_embeds_list = None
+                        break
+                if vision_embeds_list is not None:
+                    vision_embeds_all = torch.stack(vision_embeds_list, dim=0)
 
             token_counts_all = valid_mask_all.sum(dim=1).clamp(min=1.0)
             logp_old_mean_all = (logp_old_all * valid_mask_all).sum(dim=1) / token_counts_all
@@ -971,10 +1070,11 @@ for step in range(num_steps):
                     logp_old = logp_old_all[b0:b1]
                     logp_old_mean = logp_old_mean_all[b0:b1]
                     valid_mask = valid_mask_all[b0:b1]
+                    vision_embeds = vision_embeds_all[b0:b1] if vision_embeds_all is not None else None
 
                     # Compute logp_new from CURRENT policy (eval mode for dropout consistency)
                     with autocast_ctx:
-                        logp_new = -train_model(inputs, targets, loss_reduction='none').view_as(inputs)
+                        logp_new = -train_model(inputs, targets, vision_embeds=vision_embeds, loss_reduction='none').view_as(inputs)
                     token_counts = valid_mask.sum(dim=1).clamp(min=1.0)
                     logp_new_sum = (logp_new * valid_mask).sum(dim=1)
                     logp_new_mean = logp_new_sum / token_counts
@@ -1027,7 +1127,7 @@ for step in range(num_steps):
                         ref_model.eval()
                         with torch.no_grad():
                             with autocast_ctx:
-                                logp_ref = -ref_model(inputs, targets, loss_reduction='none').view_as(inputs)
+                                logp_ref = -ref_model(inputs, targets, vision_embeds=vision_embeds, loss_reduction='none').view_as(inputs)
 
                         # logp_new is per-token log-prob: [batch, seq_len]
                         # valid_mask: 1 on generated tokens, 0 on prompt: [batch, seq_len]

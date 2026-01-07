@@ -8,6 +8,11 @@ Recipes:
 - r1_rs_sft: Rejection-sampled CoT + Chat mix
 - dolci_mid: Dolci-Think mid-training for reasoning
 - dolci_rs_sft: Dolci RS-SFT (RS-CoT + Dolci mix)
+
+Vision recipes:
+- vision_pretrain: Vision-language alignment (COCO captions)
+- vision_sft: Multimodal instruction following (VQA + TextVQA + SmolTalk mix)
+- vision_sft_full: Full multimodal SFT (includes text-only tasks for stability)
 """
 
 import os
@@ -19,6 +24,14 @@ from tasks.smoltalk import SmolTalk
 from tasks.openthoughts import OpenThoughts
 from tasks.jsonl_chat import JsonlChat
 from tasks.dolci_think import DolciThink
+
+# Vision tasks (lazy import to avoid dependencies if not used)
+try:
+    from tasks.vision import COCOCaptions, VQAv2, TextVQA
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    COCOCaptions = VQAv2 = TextVQA = None
 
 
 def build_sft_recipe(
@@ -192,6 +205,64 @@ def build_sft_recipe(
         val_ds = TaskMixture([
             SmolTalk(split="test", stop=val_smoltalk_stop),
             ARC(subset="ARC-Challenge", split="test", stop=val_arc_stop),
+        ])
+        return train_ds, val_ds
+
+    # -------------------------------------------------------------------------
+    # Vision-Language Model recipes
+    # -------------------------------------------------------------------------
+
+    if recipe == "vision_pretrain":
+        # Stage 2: Vision-language alignment pretraining
+        # Train only projector + resampler, freeze LLM + vision encoder
+        if not VISION_AVAILABLE:
+            raise ImportError("Vision tasks not available. Install required packages (datasets, PIL).")
+
+        train_ds = COCOCaptions(split="train", stop=100_000)  # 100k samples
+        val_ds = COCOCaptions(split="val", stop=1000)
+        return train_ds, val_ds
+
+    if recipe == "vision_sft":
+        # Stage 3: Multimodal instruction fine-tuning
+        # Mix vision and text tasks (20% text-only to prevent forgetting)
+        if not VISION_AVAILABLE:
+            raise ImportError("Vision tasks not available. Install required packages (datasets, PIL).")
+
+        train_ds = TaskMixture([
+            VQAv2(split="train", stop=50_000),      # 50k VQA samples
+            TextVQA(split="train", stop=20_000),    # 20k TextVQA samples
+            COCOCaptions(split="train", stop=10_000),  # 10k caption samples
+            SmolTalk(split="train", stop=20_000),   # 20k text-only (prevent forgetting)
+        ])
+        val_ds = TaskMixture([
+            VQAv2(split="val", stop=1000),
+            TextVQA(split="val", stop=500),
+            SmolTalk(split="test", stop=500),
+        ])
+        return train_ds, val_ds
+
+    if recipe == "vision_sft_full":
+        # Full multimodal SFT with more text-only tasks for stability
+        # 60% vision tasks, 40% text-only tasks
+        if not VISION_AVAILABLE:
+            raise ImportError("Vision tasks not available. Install required packages (datasets, PIL).")
+
+        train_ds = TaskMixture([
+            # Vision tasks (60%)
+            VQAv2(split="train", stop=40_000),
+            TextVQA(split="train", stop=20_000),
+            COCOCaptions(split="train", stop=15_000),
+            # Text-only tasks (40%) - prevent catastrophic forgetting
+            SmolTalk(split="train", stop=30_000),
+            ARC(subset="ARC-Easy", split="train"),
+            ARC(subset="ARC-Challenge", split="train"),
+            GSM8K(subset="main", split="train", stop=5_000),
+        ])
+        val_ds = TaskMixture([
+            VQAv2(split="val", stop=1000),
+            TextVQA(split="val", stop=500),
+            SmolTalk(split="test", stop=1000),
+            ARC(subset="ARC-Challenge", split="test", stop=200),
         ])
         return train_ds, val_ds
 

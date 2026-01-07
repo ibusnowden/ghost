@@ -37,6 +37,16 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
+# Vision support
+try:
+    from PIL import Image
+    from nanochat.vision.transforms import get_vision_transforms
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    Image = None
+    get_vision_transforms = None
+
 # RL hyperparameters
 run = "dummy" # wandb run name
 source = "sft" # mid|sft
@@ -112,11 +122,39 @@ print0(f"Calculated number of steps: {num_steps}")
 @torch.no_grad()
 def get_batch():
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
+
+    # Initialize vision transforms if available
+    vision_transforms = None
+    if VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+        try:
+            vlm_config = orig_model.config
+            vision_transforms = get_vision_transforms(
+                encoder_name=vlm_config.vision_encoder_name,
+                image_size=vlm_config.vision_image_size,
+                is_train=False,
+            )
+        except:
+            pass
+
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
 
         # First get the full conversation of both user and assistant messages
         conversation = train_task[example_idx]
+
+        # Process vision if image is present
+        vision_embeds = None
+        if vision_transforms is not None and isinstance(conversation, dict):
+            image = conversation.get("image")
+            if image is not None:
+                try:
+                    if not isinstance(image, Image.Image):
+                        image = Image.open(image).convert("RGB")
+                    image_tensor = vision_transforms(image).unsqueeze(0).to(device)
+                    vision_embeds = orig_model.encode_vision(image_tensor)
+                except Exception as e:
+                    print0(f"Warning: Failed to process image: {e}")
+                    vision_embeds = None
 
         # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
         # (i.e. keep the <|assistant_start|>, but delete everything after it)
@@ -170,8 +208,15 @@ def get_batch():
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
+
+        # Replicate vision_embeds for batch if present
+        batch_vision_embeds = None
+        if vision_embeds is not None:
+            batch_size = inputs.shape[0]
+            batch_vision_embeds = vision_embeds.repeat(batch_size, 1, 1)
+
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+        yield generated_token_sequences, inputs, targets, batch_vision_embeds, rewards, advantages
 
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
@@ -188,9 +233,37 @@ def run_gsm8k_eval(task, tokenizer, engine,
     do the reduction across ranks. This is the responsibility of the caller.
     Because the evaluation can take a while, this function will yield records one by one.
     """
+    # Initialize vision transforms if available
+    vision_transforms = None
+    if VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+        try:
+            vlm_config = orig_model.config
+            vision_transforms = get_vision_transforms(
+                encoder_name=vlm_config.vision_encoder_name,
+                image_size=vlm_config.vision_image_size,
+                is_train=False,
+            )
+        except:
+            pass
+
     max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
     for idx in range(ddp_rank, max_examples, ddp_world_size):
         conversation = task[idx]
+
+        # Process vision if image is present
+        vision_embeds = None
+        if vision_transforms is not None and isinstance(conversation, dict):
+            image = conversation.get("image")
+            if image is not None:
+                try:
+                    if not isinstance(image, Image.Image):
+                        image = Image.open(image).convert("RGB")
+                    image_tensor = vision_transforms(image).unsqueeze(0).to(device)
+                    vision_embeds = orig_model.encode_vision(image_tensor)
+                except Exception as e:
+                    print0(f"Warning: Failed to process eval image: {e}")
+                    vision_embeds = None
+
         tokens = tokenizer.render_for_completion(conversation)
         prefix_length = len(tokens)
         # Generate k samples using batched generation inside the Engine
@@ -302,7 +375,7 @@ for step in range(num_steps):
     sequence_lengths = []
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        sequences_all, inputs_all, targets_all, batch_vision_embeds, rewards_all, advantages_all = next(batch_iterator)
         # Evaluate the loss and gradients
         train_model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -315,9 +388,10 @@ for step in range(num_steps):
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
+            vision_embeds = batch_vision_embeds[b0:b1] if batch_vision_embeds is not None else None
             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
             with autocast_ctx:
-                logp = -train_model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
+                logp = -train_model(inputs, targets, vision_embeds=vision_embeds, loss_reduction='none').view_as(inputs) # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank

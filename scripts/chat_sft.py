@@ -31,6 +31,17 @@ from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
 from nanochat.data_recipes import build_sft_recipe
+from nanovision.data_packing import pack_sequences, get_packing_stats
+
+# Vision support
+try:
+    from PIL import Image
+    from nanochat.vision.transforms import get_vision_transforms
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    Image = None
+    get_vision_transforms = None
 
 # -----------------------------------------------------------------------------
 # SFT Hyperparameters
@@ -75,6 +86,9 @@ deepspeed_config = "slurm/deepspeed_zero3.json"
 use_fsdp = 0 # 1 = Torch FSDP full-shard (plain AdamW)
 fsdp_min_num_params = 1_000_000 # auto-wrap threshold
 fsdp_cpu_offload = 0 # 1 = offload params to CPU (slow; last resort)
+# data packing (Phase 1 optimization - 1.8-2x speedup)
+use_sequence_packing = 1 # 1 = pack sequences to reduce padding waste (recommended)
+pack_max_length = 2048 # maximum length for packed sequences
 # evaluation and logging there of
 eval_every = 100
 eval_steps = 100
@@ -157,10 +171,16 @@ def sft_data_generator(dataset, batch_size):
     # prepares a list of tokenized conversations into a batch and yields
     def collate_and_yield(batch):
         nrows = len(batch)
-        ncols = max(len(ids) for ids, mask in batch) - 1 # seq of n creates inputs/targets of n-1
+        ncols = max(len(item[0]) for item in batch) - 1 # seq of n creates inputs/targets of n-1
         inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
         targets = torch.full((nrows, ncols), -1, dtype=torch.long) # -1 is ignore index
-        for i, (ids, mask) in enumerate(batch):
+
+        # Collect images if present
+        batch_images = []
+        for i, item in enumerate(batch):
+            ids, mask = item[0], item[1]
+            image = item[2] if len(item) > 2 else None
+
             n = len(ids)
             ids_tensor = torch.tensor(ids, dtype=torch.long)
             inputs[i, :n-1] = ids_tensor[:-1]
@@ -170,16 +190,91 @@ def sft_data_generator(dataset, batch_size):
             mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
             row_targets[mask_tensor == 0] = -1 # mask out targets where mask is 0
             targets[i, :n-1] = row_targets
+
+            # Add image if present
+            if image is not None:
+                batch_images.append(image)
+
         inputs = inputs.to(device) # move to device
         targets = targets.to(device)
-        return inputs, targets
-    # iterates over the dataset in epochs, tokenizes
-    batch = []
-    while True:
+
+        # Process vision embeddings if images are present
+        vision_embeds = None
+        if batch_images and VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+            images_tensor = torch.stack(batch_images).to(device)
+            with torch.no_grad():
+                vision_embeds = orig_model.encode_vision(images_tensor)
+
+        return inputs, targets, vision_embeds
+
+    # Get vision transforms if model has vision capabilities
+    vision_transforms = None
+    if VISION_AVAILABLE and hasattr(orig_model, 'vision_encoder') and orig_model.vision_encoder is not None:
+        vision_transforms = get_vision_transforms(
+            encoder_name=orig_model.config.vision_encoder_name,
+            image_size=orig_model.config.vision_image_size,
+            is_train=True,
+        )
+
+    # Pre-process dataset: tokenize and optionally pack sequences
+    # This happens once per epoch to prepare examples efficiently
+    def prepare_epoch_data(dataset):
+        """Tokenize and optionally pack all examples for one epoch."""
+        examples = []
         for i in range(ddp_rank, len(dataset), ddp_world_size):
             doc = dataset[i]
-            ids, mask = tokenizer.render_conversation(doc)
-            batch.append((ids, mask))
+
+            # Extract conversation
+            if isinstance(doc, dict) and "messages" in doc:
+                conversation = {"messages": doc["messages"]}
+            else:
+                conversation = doc
+
+            # Tokenize conversation
+            ids, mask = tokenizer.render_conversation(conversation)
+
+            # Process image if present
+            image_tensor = None
+            if isinstance(doc, dict) and "image" in doc and doc["image"] is not None and vision_transforms is not None:
+                image = doc["image"]
+                if not isinstance(image, Image.Image):
+                    try:
+                        image = Image.open(image).convert("RGB")
+                    except:
+                        pass  # Skip if image loading fails
+                if isinstance(image, Image.Image):
+                    image_tensor = vision_transforms(image)
+
+            examples.append((ids, mask, image_tensor))
+
+        # Apply sequence packing if enabled (1.8-2x speedup!)
+        if use_sequence_packing and pack_max_length > 0:
+            original_count = len(examples)
+            packed = pack_sequences(
+                examples,
+                max_length=pack_max_length,
+                pad_token_id=pad_token_id,
+                separator_token_id=tokenizer.encode_special("<|eos|>"),
+                shuffle=True,
+            )
+            # Log packing statistics once
+            if master_process and original_count > 0:
+                stats = get_packing_stats(examples, packed, pack_max_length)
+                print0(f"Sequence packing: {stats['original_sequences']} → {stats['packed_sequences']} sequences")
+                print0(f"  Compression: {stats['estimated_speedup']}, Padding waste: {stats['original_padding_waste_pct']:.1f}% → {stats['packed_padding_waste_pct']:.1f}%")
+            return packed
+        else:
+            return examples
+
+    # iterates over the dataset in epochs
+    batch = []
+    while True:
+        # Prepare all examples for this epoch (with optional packing)
+        epoch_data = prepare_epoch_data(dataset)
+
+        for example in epoch_data:
+            ids, mask, image_tensor = example
+            batch.append((ids, mask, image_tensor))
             if len(batch) == batch_size:
                 yield collate_and_yield(batch)
                 batch = []
@@ -264,9 +359,9 @@ for step in range(num_iterations):
         val_iter = iter(build_val_loader())
         losses = []
         for _ in range(eval_steps):
-            val_inputs, val_targets = next(val_iter)
+            val_inputs, val_targets, val_vision_embeds = next(val_iter)
             with torch.no_grad(), autocast_ctx:
-                loss = eval_model(val_inputs, val_targets)
+                loss = eval_model(val_inputs, val_targets, vision_embeds=val_vision_embeds)
             losses.append(loss)
         val_loss = torch.stack(losses).mean() # average over eval_steps
         if ddp:
@@ -330,9 +425,9 @@ for step in range(num_iterations):
     # evaluate the gradient
     num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
     for micro_step in range(grad_accum_steps):
-        train_inputs, train_targets = next(train_iter)
+        train_inputs, train_targets, train_vision_embeds = next(train_iter)
         with autocast_ctx:
-            loss = train_model(train_inputs, train_targets)
+            loss = train_model(train_inputs, train_targets, vision_embeds=train_vision_embeds)
         train_loss = loss.detach() # for logging
         if backend == "deepspeed":
             train_model.backward(loss)

@@ -22,6 +22,7 @@ SPECIAL_TOKENS = [
     "<|python_end|>",
     "<|output_start|>", # python REPL outputs back to assistant
     "<|output_end|>",
+    "<|image|>", # image placeholder token for multimodal inputs
 ]
 
 # NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
@@ -125,6 +126,10 @@ class HuggingFaceTokenizer:
         bos = self.encode_special("<|bos|>")
         return bos
 
+    def get_image_token_id(self):
+        """Get the image placeholder token ID."""
+        return self.encode_special("<|image|>")
+
     def encode(self, text, *args, **kwargs):
         if isinstance(text, str):
             return self._encode_one(text, *args, **kwargs)
@@ -146,12 +151,19 @@ class HuggingFaceTokenizer:
         self.tokenizer.save(tokenizer_path)
         print(f"Saved tokenizer to {tokenizer_path}")
 
-    def render_conversation(self, conversation, max_tokens=2048):
+    def render_conversation(self, conversation, max_tokens=2048, num_vision_tokens=64):
         """
         Tokenize a Chat conversation using Qwen2.5 ChatML format.
+        Supports vision inputs via <|image|> placeholder.
+
+        Args:
+            conversation: dict with "messages" key
+            max_tokens: maximum sequence length
+            num_vision_tokens: number of tokens to reserve for each <|image|> placeholder
+
         Returns:
-        - ids: list[int] of token ids
-        - mask: list[int] of same length, mask = 1 for tokens to train on (assistant responses)
+            - ids: list[int] of token ids
+            - mask: list[int] of same length, mask = 1 for tokens to train on (assistant responses)
         """
         ids, mask = [], []
 
@@ -164,6 +176,7 @@ class HuggingFaceTokenizer:
         # Qwen2.5 ChatML special tokens
         im_start = self.encode_special("<|im_start|>")
         im_end = self.encode_special("<|im_end|>")
+        image_token_id = self.get_image_token_id()
 
         messages = conversation["messages"]
 
@@ -187,15 +200,41 @@ class HuggingFaceTokenizer:
 
             # content
             if isinstance(content, str):
-                content_tokens = self.encode(content)
-                mask_val = 1 if role == "assistant" else 0
-                add_tokens(content_tokens, mask_val)
+                # Check for image placeholders and replace with image tokens
+                if "<|image|>" in content:
+                    # Split content by <|image|> and insert image tokens
+                    parts = content.split("<|image|>")
+                    for i, part in enumerate(parts):
+                        if part:  # Add text part
+                            content_tokens = self.encode(part)
+                            mask_val = 1 if role == "assistant" else 0
+                            add_tokens(content_tokens, mask_val)
+                        if i < len(parts) - 1:  # Add image tokens (not after last part)
+                            # Image tokens are NOT supervised (mask=0)
+                            add_tokens([image_token_id] * num_vision_tokens, 0)
+                else:
+                    # No images, standard text processing
+                    content_tokens = self.encode(content)
+                    mask_val = 1 if role == "assistant" else 0
+                    add_tokens(content_tokens, mask_val)
             elif isinstance(content, list):
                 # Handle structured content (tool calls, etc.)
                 for part in content:
-                    part_tokens = self.encode(part.get("text", ""))
-                    mask_val = 1 if role == "assistant" else 0
-                    add_tokens(part_tokens, mask_val)
+                    part_text = part.get("text", "")
+                    # Check for images in structured content too
+                    if "<|image|>" in part_text:
+                        parts = part_text.split("<|image|>")
+                        for i, text_part in enumerate(parts):
+                            if text_part:
+                                part_tokens = self.encode(text_part)
+                                mask_val = 1 if role == "assistant" else 0
+                                add_tokens(part_tokens, mask_val)
+                            if i < len(parts) - 1:
+                                add_tokens([image_token_id] * num_vision_tokens, 0)
+                    else:
+                        part_tokens = self.encode(part_text)
+                        mask_val = 1 if role == "assistant" else 0
+                        add_tokens(part_tokens, mask_val)
 
             # <|im_end|>\n
             add_tokens(im_end, 1 if role == "assistant" else 0)
@@ -207,9 +246,14 @@ class HuggingFaceTokenizer:
         mask = mask[:max_tokens]
         return ids, mask
 
-    def render_for_completion(self, conversation, max_prompt_tokens=None):
+    def render_for_completion(self, conversation, max_prompt_tokens=None, num_vision_tokens=64):
         """
         Render conversation for RL completion: prime the Assistant to generate.
+
+        Args:
+            conversation: dict with "messages" key
+            max_prompt_tokens: maximum prompt length
+            num_vision_tokens: number of tokens per <|image|> placeholder
         """
         conversation = copy.deepcopy(conversation)
         messages = conversation["messages"]
@@ -220,9 +264,9 @@ class HuggingFaceTokenizer:
 
         # Render what we have
         if max_prompt_tokens and max_prompt_tokens > 0:
-            ids, _ = self.render_conversation(conversation, max_tokens=max_prompt_tokens)
+            ids, _ = self.render_conversation(conversation, max_tokens=max_prompt_tokens, num_vision_tokens=num_vision_tokens)
         else:
-            ids, _ = self.render_conversation(conversation)
+            ids, _ = self.render_conversation(conversation, num_vision_tokens=num_vision_tokens)
 
         # Add assistant start: <|im_start|>assistant\n
         im_start = self.encode_special("<|im_start|>")
@@ -299,6 +343,10 @@ class RustBPETokenizer:
     def get_bos_token_id(self):
         return self.bos_token_id
 
+    def get_image_token_id(self):
+        """Get the image placeholder token ID."""
+        return self.encode_special("<|image|>")
+
     def encode(self, text, prepend=None, append=None, num_threads=8):
         # text can be either a string or a list of strings
 
@@ -340,12 +388,19 @@ class RustBPETokenizer:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
 
-    def render_conversation(self, conversation, max_tokens=2048):
+    def render_conversation(self, conversation, max_tokens=2048, num_vision_tokens=64):
         """
         Tokenize a single Chat conversation (which we call a "doc" or "document" here).
+        Supports vision inputs via <|image|> placeholder.
+
+        Args:
+            conversation: dict with "messages" key
+            max_tokens: maximum sequence length
+            num_vision_tokens: number of tokens to reserve for each <|image|> placeholder
+
         Returns:
-        - ids: list[int] is a list of token ids of this rendered conversation
-        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
+            - ids: list[int] is a list of token ids of this rendered conversation
+            - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
         """
         # ids, masks that we will return and a helper function to help build them up.
         ids, mask = [], []
@@ -374,6 +429,7 @@ class RustBPETokenizer:
         assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
         python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
         output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+        image_token_id = self.get_image_token_id()
 
         # now we can tokenize the conversation
         add_tokens(bos, 0)
@@ -388,35 +444,84 @@ class RustBPETokenizer:
 
             if message["role"] == "user":
                 assert isinstance(content, str), "User messages are simply expected to be strings"
-                value_ids = self.encode(content)
                 add_tokens(user_start, 0)
-                add_tokens(value_ids, 0)
+
+                # Check for image placeholders and replace with image tokens
+                if "<|image|>" in content:
+                    parts = content.split("<|image|>")
+                    for j, part in enumerate(parts):
+                        if part:  # Add text part
+                            value_ids = self.encode(part)
+                            add_tokens(value_ids, 0)
+                        if j < len(parts) - 1:  # Add image tokens (not after last part)
+                            # Image tokens are NOT supervised (mask=0)
+                            add_tokens([image_token_id] * num_vision_tokens, 0)
+                else:
+                    # No images, standard text processing
+                    value_ids = self.encode(content)
+                    add_tokens(value_ids, 0)
+
                 add_tokens(user_end, 0)
             elif message["role"] == "assistant":
                 add_tokens(assistant_start, 0)
                 if isinstance(content, str):
-                    # simple string => simply add the tokens
-                    value_ids = self.encode(content)
-                    add_tokens(value_ids, 1)
+                    # Check for image placeholders in assistant messages (rare but possible)
+                    if "<|image|>" in content:
+                        parts = content.split("<|image|>")
+                        for j, part in enumerate(parts):
+                            if part:
+                                value_ids = self.encode(part)
+                                add_tokens(value_ids, 1)
+                            if j < len(parts) - 1:
+                                add_tokens([image_token_id] * num_vision_tokens, 0)
+                    else:
+                        # simple string => simply add the tokens
+                        value_ids = self.encode(content)
+                        add_tokens(value_ids, 1)
                 elif isinstance(content, list):
                     for part in content:
-                        value_ids = self.encode(part["text"])
-                        if part["type"] == "text":
-                            # string part => simply add the tokens
-                            add_tokens(value_ids, 1)
-                        elif part["type"] == "python":
-                            # python tool call => add the tokens inside <|python_start|> and <|python_end|>
-                            add_tokens(python_start, 1)
-                            add_tokens(value_ids, 1)
-                            add_tokens(python_end, 1)
-                        elif part["type"] == "python_output":
-                            # python output => add the tokens inside <|output_start|> and <|output_end|>
-                            # none of these tokens are supervised because the tokens come from Python at test time
-                            add_tokens(output_start, 0)
-                            add_tokens(value_ids, 0)
-                            add_tokens(output_end, 0)
+                        part_text = part["text"]
+                        # Check for images in structured content
+                        if "<|image|>" in part_text:
+                            text_parts = part_text.split("<|image|>")
+                            for k, text_chunk in enumerate(text_parts):
+                                if text_chunk:
+                                    value_ids = self.encode(text_chunk)
+                                    if part["type"] == "text":
+                                        add_tokens(value_ids, 1)
+                                    elif part["type"] == "python":
+                                        if k == 0:
+                                            add_tokens(python_start, 1)
+                                        add_tokens(value_ids, 1)
+                                        if k == len(text_parts) - 1:
+                                            add_tokens(python_end, 1)
+                                    elif part["type"] == "python_output":
+                                        if k == 0:
+                                            add_tokens(output_start, 0)
+                                        add_tokens(value_ids, 0)
+                                        if k == len(text_parts) - 1:
+                                            add_tokens(output_end, 0)
+                                if k < len(text_parts) - 1:
+                                    add_tokens([image_token_id] * num_vision_tokens, 0)
                         else:
-                            raise ValueError(f"Unknown part type: {part['type']}")
+                            # No images, standard processing
+                            value_ids = self.encode(part_text)
+                            if part["type"] == "text":
+                                # string part => simply add the tokens
+                                add_tokens(value_ids, 1)
+                            elif part["type"] == "python":
+                                # python tool call => add the tokens inside <|python_start|> and <|python_end|>
+                                add_tokens(python_start, 1)
+                                add_tokens(value_ids, 1)
+                                add_tokens(python_end, 1)
+                            elif part["type"] == "python_output":
+                                # python output => add the tokens inside <|output_start|> and <|output_end|>
+                                # none of these tokens are supervised because the tokens come from Python at test time
+                                add_tokens(output_start, 0)
+                                add_tokens(value_ids, 0)
+                                add_tokens(output_end, 0)
+                            else:
+                                raise ValueError(f"Unknown part type: {part['type']}")
                 else:
                     raise ValueError(f"Unknown content type: {type(content)}")
                 add_tokens(assistant_end, 1)
@@ -438,11 +543,16 @@ class RustBPETokenizer:
             tokens.append(f"{color}{token_str}{RESET}")
         return '|'.join(tokens)
 
-    def render_for_completion(self, conversation, max_prompt_tokens=None):
+    def render_for_completion(self, conversation, max_prompt_tokens=None, num_vision_tokens=64):
         """
         Used during Reinforcement Learning. In that setting, we want to
         render the conversation priming the Assistant for a completion.
         Unlike the Chat SFT case, we don't need to return the mask.
+
+        Args:
+            conversation: dict with "messages" key
+            max_prompt_tokens: maximum prompt length
+            num_vision_tokens: number of tokens per <|image|> placeholder
         """
         # We have some surgery to do: we need to pop the last message (of the Assistant)
         conversation = copy.deepcopy(conversation) # avoid mutating the original
@@ -452,9 +562,9 @@ class RustBPETokenizer:
 
         # Now tokenize the conversation
         if max_prompt_tokens and max_prompt_tokens > 0:
-            ids, mask = self.render_conversation(conversation, max_tokens=max_prompt_tokens)
+            ids, mask = self.render_conversation(conversation, max_tokens=max_prompt_tokens, num_vision_tokens=num_vision_tokens)
         else:
-            ids, mask = self.render_conversation(conversation)
+            ids, mask = self.render_conversation(conversation, num_vision_tokens=num_vision_tokens)
 
         # Finally, to prime the Assistant for a completion, append the Assistant start token
         assistant_start = self.encode_special("<|assistant_start|>")
