@@ -27,7 +27,7 @@ from tasks.dolci_think import DolciThink
 
 # Vision tasks (lazy import to avoid dependencies if not used)
 try:
-    from tasks.vision import COCOCaptions, VQAv2, TextVQA
+    from tasks import COCOCaptions, VQAv2, TextVQA
     VISION_AVAILABLE = True
 except ImportError:
     VISION_AVAILABLE = False

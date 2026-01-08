@@ -53,16 +53,9 @@ class GPTConfig:
     use_fused_kernels: bool = True # Use fused RMSNorm and SwiGLU (3-5x speedup)
     use_fused_loss: bool = True # Use fused cross-entropy (Phase 3, 2x loss speedup)
     use_gradient_checkpointing: bool = False # Enable gradient checkpointing (Phase 3, 2x longer contexts)
-    # MoE (Mixture-of-Experts) MLP. Disabled by default.
-    moe_num_experts: int = 0 # 0 disables MoE
-    moe_top_k: int = 1 # top-k routing (1=Switch, 2=Mixtral-style)
-    moe_layer_start: int = 0 # first layer index to apply MoE (inclusive)
-    moe_layer_end: int = -1 # last layer index (exclusive), -1 means n_layer
-    moe_layer_stride: int = 1 # apply MoE every N layers
-    moe_capacity_factor: float = 1.25 # token capacity per expert = ceil(capacity_factor * tokens / experts)
-    moe_aux_loss_coef: float = 0.01 # load-balancing loss coefficient (0 disables)
+   
     # Vision encoder config (None = text-only model)
-    vision_encoder_name: str = None # "siglip_vit_l14" | "clip_vit_l14" | None
+    vision_encoder_name: str = None # "siglip_vit_l14" |
     vision_encoder_trainable: bool = False
     vision_image_size: int = 336
     # Resampler config
@@ -223,9 +216,7 @@ class MLP(nn.Module):
             # SwiGLU activation: gate and up projections
             self.c_gate = nn.Linear(config.n_embd, intermediate_size, bias=False)
             self.c_up = nn.Linear(config.n_embd, intermediate_size, bias=False)
-        elif self.mlp_type == "relu2":
-            # Legacy ReLU^2 activation
-            self.c_fc = nn.Linear(config.n_embd, intermediate_size, bias=False)
+          
         else:
             raise ValueError(f"Unsupported mlp_type: {self.mlp_type}")
         self.c_proj = nn.Linear(intermediate_size, config.n_embd, bias=False)
@@ -256,9 +247,7 @@ class MLP(nn.Module):
             gate = F.silu(self.c_gate(x))
             up = self.c_up(x)
             x = gate * up
-        else:
-            # ReLU^2
-            x = F.relu(self.c_fc(x)).square()
+       
         x = self.c_proj(x)
         return x, x.new_zeros((), dtype=torch.float32)
 
@@ -271,130 +260,6 @@ def _is_moe_layer(config: GPTConfig, layer_idx: int) -> bool:
     stride = max(1, int(config.moe_layer_stride))
     return start <= layer_idx < end and (layer_idx - start) % stride == 0
 
-
-class MoE(nn.Module):
-    """
-    Minimal token-choice MoE MLP.
-    - top-1 (Switch) or top-2 routing
-    - fixed per-expert capacity for static shapes
-    - simple Switch-style load-balancing auxiliary loss
-    """
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.moe_num_experts > 0
-        assert config.moe_top_k in (1, 2), "Only top-1 and top-2 routing are supported"
-        assert config.moe_capacity_factor > 0
-
-        self.num_experts = int(config.moe_num_experts)
-        self.top_k = int(config.moe_top_k)
-        self.capacity_factor = float(config.moe_capacity_factor)
-        self.aux_loss_coef = float(config.moe_aux_loss_coef)
-
-        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
-
-    def forward(self, x: torch.Tensor):
-        B, T, C = x.shape
-        N = B * T
-        x_flat = x.view(N, C)
-
-        # Router in fp32 for stability.
-        router_logits = self.router(x_flat)
-        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # (N, E)
-
-        topk = torch.topk(router_probs, k=self.top_k, dim=-1)
-        expert_idx = topk.indices  # (N, k)
-        gates = topk.values  # (N, k)
-        gates = gates / gates.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-
-        # Switch-style load balancing loss.
-        aux_loss = x_flat.new_zeros((), dtype=torch.float32)
-        if self.aux_loss_coef > 0:
-            importance = router_probs.mean(dim=0)  # (E,)
-            if self.top_k == 1:
-                load = F.one_hot(expert_idx[:, 0], num_classes=self.num_experts).to(torch.float32).mean(dim=0)
-            else:
-                load = (
-                    (F.one_hot(expert_idx[:, 0], num_classes=self.num_experts)
-                     + F.one_hot(expert_idx[:, 1], num_classes=self.num_experts))
-                    .to(torch.float32)
-                    .mean(dim=0)
-                    / self.top_k
-                )
-            aux_loss = (importance * load).sum() * self.num_experts * self.aux_loss_coef
-
-        # Fixed capacity buffers => static shapes for torch.compile.
-        capacity = max(1, math.ceil(self.capacity_factor * N / self.num_experts))
-        expert_in = x_flat.new_zeros((self.num_experts * capacity, C))
-
-        def positions_from_onehot(one_hot: torch.Tensor) -> torch.Tensor:
-            # one_hot: (N, E) int
-            cumsum = torch.cumsum(one_hot, dim=0) - 1
-            return (cumsum * one_hot).sum(dim=-1)  # (N,)
-
-        if self.top_k == 1:
-            idx1 = expert_idx[:, 0]
-            gate1 = gates[:, 0]
-
-            one_hot1 = F.one_hot(idx1, num_classes=self.num_experts).to(torch.int32)
-            pos1 = positions_from_onehot(one_hot1)
-            mask1 = pos1 < capacity
-            slot1 = idx1 * capacity + pos1
-
-            expert_in.index_copy_(0, slot1[mask1], x_flat[mask1])
-
-            expert_in = expert_in.view(self.num_experts, capacity, C)
-            expert_out = torch.empty_like(expert_in)
-            for e in range(self.num_experts):
-                y_e, _ = self.experts[e](expert_in[e])
-                expert_out[e] = y_e
-            expert_out_flat = expert_out.view(self.num_experts * capacity, C)
-
-            y_flat = torch.zeros_like(x_flat)
-            w1 = (gate1 * mask1.to(gate1.dtype)).to(dtype=x_flat.dtype)
-            y_flat[mask1] = expert_out_flat[slot1[mask1]] * w1[mask1][:, None]
-            return y_flat.view(B, T, C), aux_loss
-
-        # top-2 routing (top-1 gets priority capacity)
-        idx1, idx2 = expert_idx[:, 0], expert_idx[:, 1]
-        gate1, gate2 = gates[:, 0], gates[:, 1]
-
-        one_hot1 = F.one_hot(idx1, num_classes=self.num_experts).to(torch.int32)
-        pos1 = positions_from_onehot(one_hot1)
-        mask1 = pos1 < capacity
-        slot1 = idx1 * capacity + pos1
-
-        # Count how many top-1 tokens actually fit per expert (cap at capacity).
-        count1 = torch.clamp(one_hot1.sum(dim=0), max=capacity)  # (E,)
-
-        one_hot2 = F.one_hot(idx2, num_classes=self.num_experts).to(torch.int32)
-        pos2 = positions_from_onehot(one_hot2)
-        pos2 = pos2 + count1.gather(0, idx2)
-        mask2 = pos2 < capacity
-        slot2 = idx2 * capacity + pos2
-
-        expert_in.index_copy_(0, slot1[mask1], x_flat[mask1])
-        expert_in.index_copy_(0, slot2[mask2], x_flat[mask2])
-
-        expert_in = expert_in.view(self.num_experts, capacity, C)
-        expert_out = torch.empty_like(expert_in)
-        for e in range(self.num_experts):
-            y_e, _ = self.experts[e](expert_in[e])
-            expert_out[e] = y_e
-        expert_out_flat = expert_out.view(self.num_experts * capacity, C)
-
-        # Gate renormalization when capacity drops an assignment.
-        g1 = gate1 * mask1.to(gate1.dtype)
-        g2 = gate2 * mask2.to(gate2.dtype)
-        denom = (g1 + g2).clamp_min(1e-9)
-        g1 = (g1 / denom).to(dtype=x_flat.dtype)
-        g2 = (g2 / denom).to(dtype=x_flat.dtype)
-
-        y_flat = torch.zeros_like(x_flat)
-        y_flat[mask1] += expert_out_flat[slot1[mask1]] * g1[mask1][:, None]
-        y_flat[mask2] += expert_out_flat[slot2[mask2]] * g2[mask2][:, None]
-        return y_flat.view(B, T, C), aux_loss
 
 
 class Block(nn.Module):
