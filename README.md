@@ -1,14 +1,69 @@
-# nanochat
+# GhostVis
 
 ![nanochat logo](dev/nanochat.png)
 
-> The best ChatGPT that $100 can buy.
+> Vision-Language Model: The best multimodal ChatGPT you can train yourself.
 
-This repo is a full-stack implementation of an LLM like ChatGPT in a single, clean, minimal, hackable, dependency-lite codebase. nanochat is designed to run on a single 8XH100 node via scripts like [speedrun.sh](speedrun.sh), that run the entire pipeline start to end. This includes tokenization, pretraining, finetuning, evaluation, inference, and web serving over a simple UI so that you can talk to your own LLM just like ChatGPT. nanochat will become the capstone project of the course LLM101n being developed by Eureka Labs.
+**GhostVis** is a vision-language model built on top of [nanochat](https://github.com/karpathy/nanochat), transforming a text-only LLM into a full multimodal system capable of understanding both images and text. Like nanochat, it maintains a clean, minimal, hackable codebase designed to run on a single 8XH100 node.
+
+## What is GhostVis?
+
+GhostVis extends nanochat's capabilities by adding:
+- **Vision Understanding**: Process images alongside text using a frozen vision encoder (SigLIP/CLIP)
+- **Modern Architecture**: Built on Qwen2.5-1.5B with SwiGLU activation and Grouped-Query Attention (GQA)
+- **LLaVA-Style Fusion**: Vision encoder → Perceiver resampler → MLP projector → LLM
+- **Full Pipeline**: Pretraining, vision alignment, multimodal SFT, RL, and inference
+- **Hackable Design**: Same nanochat philosophy - minimal, readable, forkable code
+
+## Current Status
+
+🚧 **In Development** - Vision capabilities are being implemented
+
+**Completed:**
+- ✅ Vision module foundation (encoder, resampler, projector)
+- ✅ Model integration (GPT class extensions)
+- ✅ Tokenizer & conversation rendering with image support
+- ✅ Vision dataset loaders (COCO, VQA, TextVQA, ChartQA)
+
+**In Progress:**
+- 🔄 Training script modifications
+- 🔄 Inference & serving updates
+- 🔄 Vision benchmarks
+
+See [skills.md](skills.md) for the complete implementation roadmap.
+
+## Architecture Overview
+
+```
+Input Image (PIL)
+    ↓
+Vision Encoder (SigLIP ViT-L/14) [Frozen]
+    ↓ [B, 256, 1024]
+Vision Resampler (Perceiver)
+    ↓ [B, 64, 1024]
+Vision Projector (2-layer MLP)
+    ↓ [B, 64, 1536]
+Vision Embeddings
+    ↓
+    ⊕ (concat) ← Text Embeddings [B, T, 1536]
+    ↓
+GPT Transformer (Qwen2.5-1.5B: 28L, SwiGLU, GQA 6:1)
+    ↓
+Output Logits
+```
+
+**Key Features:**
+- **Base Model**: Qwen2.5-1.5B (1.5B parameters, 28 layers, 1536 hidden dim)
+- **Activation**: SwiGLU (better than ReLU/GELU for modern LLMs)
+- **Attention**: Grouped-Query Attention (6:1 ratio for efficient inference)
+- **Context**: 32k tokens (more than enough for vision + long conversations)
+- **Vision**: 64 tokens per image at 336×336 resolution
 
 ## Quick start
 
-The fastest way to feel the magic is to run the speedrun script [speedrun.sh](speedrun.sh), which trains and inferences the $100 tier of nanochat. On an 8XH100 node at $24/hr, this gives a total run time of about 4 hours. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+### Text-Only Training (Original nanochat)
+
+The fastest way to feel the magic is to run the speedrun script [speedrun.sh](speedrun.sh), which trains and inferences the $100 tier model. On an 8XH100 node at $24/hr, this gives a total run time of about 4 hours. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
 
 ```bash
 bash speedrun.sh
@@ -27,6 +82,31 @@ python -m scripts.chat_web
 ```
 
 And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
+
+### Vision-Language Training (GhostVis)
+
+🚧 **Coming Soon** - Full vision training pipeline
+
+Once vision training is complete, you'll be able to train a multimodal model:
+
+```bash
+# Stage 1: Base pretraining (text-only, ~4 hours)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20
+
+# Stage 2: Vision alignment (~2-3 hours)
+torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- --architecture_style=vlm_1.5b
+
+# Stage 3: Multimodal SFT (~3-4 hours)
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --data_recipe_name=vision_sft
+
+# Stage 4: Serve the vision model
+python -m scripts.chat_web
+# Then use /image path/to/image.jpg to chat with images
+```
+
+**Total training time**: ~13 hours | **Total cost**: ~$312 on 8XH100 @ $24/hr
+
+See [skills.md](skills.md) for the complete vision training roadmap.
 
 ---
 
@@ -82,24 +162,57 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_
 
 That's it! The biggest thing to pay attention to is making sure you have enough data shards to train on (the code will loop and do more epochs over the same training set otherwise, decreasing learning speed a bit), and managing your memory/VRAM, primarily by decreasing the `device_batch_size` until things fit (the scripts automatically compensates by increasing the number of gradient accumulation loops, simply turning parallel compute to sequential compute).
 
-And a bit more about computing environments that will run nanochat:
+And a bit more about computing environments that will run GhostVis/nanochat:
 
 - The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
 - All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
 - If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't implemented this out of the box so it might take a bit of tinkering.
 
-## Questions
+## Documentation
 
-nanochat is designed to be short and sweet. One big advantage of this is that we can package up all of the files together and copy paste them to your favorite LLM to ask arbitrary questions. As an example, I like to package up the repo using the [files-to-prompt](https://github.com/simonw/files-to-prompt) utility like so:
+GhostVis includes comprehensive documentation for all aspects of the vision-language implementation:
+
+### Core Documentation
+- **[skills.md](skills.md)** - Complete implementation roadmap for vision capabilities (7 phases, detailed specs)
+- **[walkthrough.md](walkthrough.md)** - Qwen2.5 integration walkthrough (SwiGLU, GQA, GPU metrics)
+- **[MODEL_CONFIG_ANALYSIS.md](MODEL_CONFIG_ANALYSIS.md)** - Deep dive into model architecture choices (SwiGLU vs ReLU, GQA ratios, context windows)
+
+### Implementation Details
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - High-level project status and architecture overview
+- **[docs/AGENTS.md](docs/AGENTS.md)** - R1-style post-training pipeline (GRPO, rejection sampling)
+
+### Training & Optimization Guides
+- **[COMPLETE_OPTIMIZATION_GUIDE.md](COMPLETE_OPTIMIZATION_GUIDE.md)** - Comprehensive optimization reference
+- **[PHASE1_OPTIMIZATIONS_COMPLETE.md](PHASE1_OPTIMIZATIONS_COMPLETE.md)** - Phase 1 optimizations
+- **[PHASE2_OPTIMIZATIONS_COMPLETE.md](PHASE2_OPTIMIZATIONS_COMPLETE.md)** - Phase 2 optimizations
+- **[PHASE3_OPTIMIZATIONS_COMPLETE.md](PHASE3_OPTIMIZATIONS_COMPLETE.md)** - Phase 3 optimizations
+- **[OPTIMIZATIONS_SUMMARY.md](OPTIMIZATIONS_SUMMARY.md)** - Quick optimization summary
+
+### Verification & Testing
+- **[PIPELINE_VERIFICATION.md](PIPELINE_VERIFICATION.md)** - Training pipeline verification
+- **[TRAINING_TIMELINE.md](TRAINING_TIMELINE.md)** - Expected training timelines
+
+## Questions & Exploring the Code
+
+GhostVis (like nanochat) is designed to be short and sweet. One big advantage of this is that we can package up all of the files together and copy paste them to your favorite LLM to ask arbitrary questions. As an example, I like to package up the repo using the [files-to-prompt](https://github.com/simonw/files-to-prompt) utility like so:
 
 ```bash
 files-to-prompt . -e py -e md -e rs -e html -e toml -e sh --ignore "*target*" --cxml > packaged.txt
 ```
 
-This includes all py, rs, html, toml, sh files, excludes the `rustbpe/target` folder, and chooses the cxml output format. Everything is written to the `packaged.txt` file, which atm measures ~330KB (i.e. well below ~100K tokens for a state of the art LLM), and ~8K lines of code in 45 files.
+This includes all py, rs, html, toml, sh files, excludes the `rustbpe/target` folder, and chooses the cxml output format. Everything is written to the `packaged.txt` file.
 
 Alternatively, I recommend using [DeepWiki](https://deepwiki.com/) from Devin/Cognition to ask questions of this repo. In the URL of this repo, simply change github.com to deepwiki.com, and you're off.
+
+**Key files to start exploring:**
+- `nanovision/gpt.py` - Core model architecture (Qwen2.5 with vision support)
+- `nanovision/model_configs.py` - Model configurations (Qwen2.5-1.5B, 7B, small variants)
+- `nanovision/vision/` - Vision modules (encoder, resampler, projector)
+- `tasks/vision/` - Vision dataset loaders (VQA, COCO, TextVQA, ChartQA)
+- `scripts/base_train.py` - Pretraining script
+- `scripts/chat_sft.py` - SFT script (being extended for vision)
+- **[skills.md](skills.md)** - Complete vision implementation roadmap
 
 ## Tests
 
@@ -111,21 +224,32 @@ python -m pytest tests/test_rustbpe.py -v -s
 
 ## Contributing
 
-nanochat is nowhere finished. The goal is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there will be no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a concrete ChatGPT clone and its report card.
+GhostVis extends nanochat's mission to make state-of-the-art models accessible. The goal is to improve the state of the art in micro vision-language models that are accessible to work with end to end on budgets of < $1000 dollars. Like nanochat, GhostVis maintains the philosophy: no giant configuration objects, model factories, or if-then-else monsters. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase for vision-language models.
+
+**Vision Roadmap**: See [skills.md](skills.md) for the detailed implementation plan.
 
 ## Acknowledgements
 
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
+- **GhostVis** is built on top of [nanochat](https://github.com/karpathy/nanochat) by Andrej Karpathy
+- The name (nanochat) derives from [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining
+- nanochat is inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified nanoGPT with clear metrics and a leaderboard
+- Vision architecture inspired by [LLaVA](https://llava-vl.github.io/) and [Qwen-VL](https://github.com/QwenLM/Qwen-VL)
+- Base LLM architecture from [Qwen2.5](https://github.com/QwenLM/Qwen2.5) (SwiGLU, GQA)
+- Thank you to [HuggingFace](https://huggingface.co/) for fineweb, smoltalk, and vision datasets
+- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project
+- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance
 
 ## Cite
 
-If you find nanochat helpful in your research cite simply as:
+If you find GhostVis helpful in your research, please cite both GhostVis and the original nanochat:
 
 ```bibtex
+@misc{ghostvis,
+  title = {GhostVis: Vision-Language Model Extension of nanochat},
+  year = {2025},
+  note = {Built on nanochat by Andrej Karpathy}
+}
+
 @misc{nanochat,
   author = {Andrej Karpathy},
   title = {nanochat: The best ChatGPT that $100 can buy},
