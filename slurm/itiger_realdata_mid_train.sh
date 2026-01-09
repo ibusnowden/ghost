@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=nanochat-mid
+#SBATCH --job-name=ghostvis-mid
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --time=02:00:00
-#SBATCH --output=realdata_mid_%j.out
-#SBATCH --error=realdata_mid_%j.err
+#SBATCH --time=04:00:00
+#SBATCH --output=vision_mid_%j.out
+#SBATCH --error=vision_mid_%j.err
 #
-# Short midtraining on real-data base checkpoint.
+# Phase 2: Vision alignment - trains projector + resampler only.
 
 set -euo pipefail
 
@@ -22,7 +22,7 @@ cd "$NANOCHAT_ROOT"
 mkdir -p logs
 
 echo "========================================"
-echo "nanochat midtraining"
+echo "GhostVis Phase 2: Vision Alignment"
 echo "========================================"
 echo "Job ID: ${SLURM_JOB_ID:-}"
 echo "Node: ${SLURM_NODELIST:-$(hostname)}"
@@ -94,9 +94,8 @@ if [ -z "$NGPUS" ] || [ "$NGPUS" -le 0 ]; then
 fi
 echo "Using NGPUS=$NGPUS"
 
-# Checkpoint selection
-DEPTH="${DEPTH:-4}"
-MODEL_TAG="${MODEL_TAG:-d$DEPTH}"   # matches base checkpoints directory name
+# Model configuration
+DEPTH="${DEPTH:-32}"                # transformer depth (scales model size)
 STEP_OPT=()
 if [ -n "${STEP:-}" ]; then
   STEP_OPT=(--step="$STEP")
@@ -104,27 +103,23 @@ fi
 
 echo ""
 echo "Run config:"
-echo "  MODEL_TAG=$MODEL_TAG STEP=${STEP:-latest}"
+echo "  DEPTH=$DEPTH STEP=${STEP:-latest}"
 echo ""
 
 echo "========================================"
-echo "Step 1: Midtraining"
+echo "Vision Alignment Training"
 echo "========================================"
-torchrun --standalone --nproc_per_node="$NGPUS" -m scripts.mid_train -- \
-  --run="${WANDB_RUN_BASE}_mid" \
-  --model_tag="$MODEL_TAG" \
-  --max_seq_len="${MAX_SEQ_LEN:-4096}" \
-  --device_batch_size="${DEVICE_BATCH_SIZE:-2}" \
-  --total_batch_size="${TOTAL_BATCH_SIZE:-524288}" \
-  --length_buckets="[(2048,0.6),(4096,0.4)]" \
+echo "Trainable: Projector + Resampler"
+echo "Frozen: LLM + Vision Encoder"
+echo ""
+
+torchrun --standalone --nproc_per_node="$NGPUS" -m scripts.vision_pretrain -- \
+  --run="${WANDB_RUN_BASE}_vision" \
+  --depth="$DEPTH" \
+  --source=base \
+  --device_batch_size="${DEVICE_BATCH_SIZE:-16}" \
+  --data_recipe=vision_pretrain \
   "${STEP_OPT[@]}"
-
-echo ""
-echo "========================================"
-echo "Step 2: Chat Eval on mid checkpoint"
-echo "========================================"
-export WANDB_RUN="${WANDB_RUN_EVAL:-${WANDB_RUN_BASE}_eval}"
-torchrun --standalone --nproc_per_node="$NGPUS" -m scripts.chat_eval -- -i mid
 
 echo ""
 echo "Done."

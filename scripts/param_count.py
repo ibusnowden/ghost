@@ -25,7 +25,7 @@ from nanochat.common import print0, get_base_dir
 # -----------------------------------------------------------------------------
 # User settings (override via nanochat/configurator.py using --key=value)
 
-architecture_style = "qwen25_1.5b"  # qwen25_small | qwen25_1.5b | qwen25_7b | original
+architecture_style = "qwen25_1.5b"  # qwen25_small | qwen25_1.5b
 depth = 20  # used for qwen25_small/original
 max_seq_len = 2048  # sequence length (does NOT change parameter count)
 
@@ -95,23 +95,9 @@ def _build_config() -> GPTConfig:
         vs = _load_vocab_size_from_tokenizer()
         print0(f"Inferred vocab_size from tokenizer: {vs:,}")
 
-    from nanochat.model_configs import (
-        get_qwen25_small_config,
-        get_qwen25_1_5b_config,
-        get_qwen25_7b_config,
-        get_nanochat_original_config,
-    )
+    from nanochat.model_configs import get_config
 
-    if architecture_style == "qwen25_small":
-        config = get_qwen25_small_config(vocab_size=vs, sequence_len=max_seq_len, depth=depth)
-    elif architecture_style == "qwen25_1.5b":
-        config = get_qwen25_1_5b_config(vocab_size=vs, sequence_len=max_seq_len)
-    elif architecture_style == "qwen25_7b":
-        config = get_qwen25_7b_config(vocab_size=vs, sequence_len=max_seq_len)
-    elif architecture_style == "original":
-        config = get_nanochat_original_config(vocab_size=vs, sequence_len=max_seq_len, depth=depth)
-    else:
-        raise ValueError(f"Unknown architecture_style: {architecture_style}")
+    config = get_config(depth=depth, vocab_size=vs, sequence_len=max_seq_len)
 
     # Apply MoE knobs (mirrors scripts/base_train.py)
     config.moe_num_experts = int(moe_num_experts)

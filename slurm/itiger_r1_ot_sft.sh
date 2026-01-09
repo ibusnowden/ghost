@@ -1,15 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=nanochat-r1-ot
+#SBATCH --job-name=ghostvis-sft
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=5
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=128G
-#SBATCH --nodelist=itiger01
-#SBATCH --output=r1_ot_%j.out
-#SBATCH --error=r1_ot_%j.err
+#SBATCH --output=sft_%j.out
+#SBATCH --error=sft_%j.err
 #
-# Phase 1 (Cold start): SFT on OpenThoughts (reasoning traces).
+# Phase 3: Multimodal SFT - trains last N LLM layers + projector.
 
 set -euo pipefail
 
@@ -53,7 +52,7 @@ export PYTHONPATH="$NANOCHAT_ROOT:${PYTHONPATH:-}"
 mkdir -p logs
 
 echo "========================================"
-echo "nanochat R1 Phase 1: OpenThoughts SFT"
+echo "GhostVis Phase 3: Multimodal SFT"
 echo "========================================"
 echo "Job ID: ${SLURM_JOB_ID:-}"
 echo "Node: ${SLURM_NODELIST:-$(hostname)}"
@@ -215,9 +214,9 @@ fi
 echo "Using NGPUS=$NGPUS"
 
 # Config
-SFT_SOURCE="${SFT_SOURCE:-sft}"  # sft=d32, mid=pretrained
-MODEL_TAG="${MODEL_TAG:-d32}"
-STEP="${STEP:-20832}"
+DEPTH="${DEPTH:-32}"              # transformer depth
+SFT_SOURCE="${SFT_SOURCE:-mid}"   # mid=vision aligned checkpoint
+STEP="${STEP:-}"                  # empty = latest
 SFT_RECIPE="${SFT_RECIPE:-r1_ot_mixed}"    # r1_ot | r1_ot_mixed | dolci_hf
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-4}"
 NUM_STEPS="${NUM_STEPS:-}"  # empty = dataset default
@@ -235,9 +234,9 @@ DOLCI_STREAM_CACHE="${DOLCI_STREAM_CACHE:-}"
 
 echo ""
 echo "Run config:"
+echo "  DEPTH=$DEPTH"
 echo "  SFT_SOURCE=$SFT_SOURCE"
-echo "  MODEL_TAG=$MODEL_TAG"
-echo "  STEP=$STEP"
+echo "  STEP=${STEP:-latest}"
 echo "  SFT_RECIPE=$SFT_RECIPE"
 if [ "$SFT_RECIPE" = "dolci_hf" ]; then
   echo "  DOLCI_STOP=$DOLCI_STOP (loading from HF cache)"
@@ -305,15 +304,13 @@ fi
 if [ -n "$NUM_STEPS" ]; then
   EXTRA_ARGS="$EXTRA_ARGS --num_steps=$NUM_STEPS"
 fi
-if [ -n "$MODEL_TAG" ]; then
-  EXTRA_ARGS="$EXTRA_ARGS --model_tag=$MODEL_TAG"
-fi
 if [ -n "$STEP" ]; then
   EXTRA_ARGS="$EXTRA_ARGS --step=$STEP"
 fi
 
 torchrun --standalone --nproc_per_node="$NGPUS" -m scripts.chat_sft -- \
   --run="${WANDB_RUN_BASE}_${SFT_RECIPE}" \
+  --depth="$DEPTH" \
   --source="$SFT_SOURCE" \
   --sft_recipe="$SFT_RECIPE" \
   --device_batch_size="$DEVICE_BATCH_SIZE" \

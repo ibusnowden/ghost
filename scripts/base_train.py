@@ -54,7 +54,7 @@ load_checkpoint_optimizer = 0 # 1 = also load optimizer state (when available)
 # User settings
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Model architecture
-architecture_style = "qwen25_small" # "qwen25_small", "qwen25_1.5b", "qwen25_7b", or "original" for backward compat
+architecture_style = "qwen25_small" # "qwen25_small" or "qwen25_1.5b"
 depth = 20 # the depth of the Transformer model to train (used for qwen25_small and original styles)
 max_seq_len = 2048 # max context length
 # Smoke test helpers
@@ -141,27 +141,10 @@ else:
     print0(f"Vocab size: {vocab_size:,}")
 
 # Model configuration based on architecture style
-from nanochat.model_configs import (
-    get_qwen25_small_config,
-    get_qwen25_1_5b_config,
-    get_qwen25_7b_config,
-    get_nanochat_original_config,
-)
+from nanochat.model_configs import get_config
 
-if architecture_style == "qwen25_small":
-    model_config = get_qwen25_small_config(vocab_size=vocab_size, sequence_len=max_seq_len, depth=depth)
-    print0(f"Using Qwen2.5-style small model (depth={depth})")
-elif architecture_style == "qwen25_1.5b":
-    model_config = get_qwen25_1_5b_config(vocab_size=vocab_size, sequence_len=max_seq_len)
-    print0("Using Qwen2.5-Coder-1.5B configuration")
-elif architecture_style == "qwen25_7b":
-    model_config = get_qwen25_7b_config(vocab_size=vocab_size, sequence_len=max_seq_len)
-    print0("Using Qwen2.5-Coder-7B configuration")
-elif architecture_style == "original":
-    model_config = get_nanochat_original_config(vocab_size=vocab_size, sequence_len=max_seq_len, depth=depth)
-    print0(f"Using original nanochat configuration (depth={depth})")
-else:
-    raise ValueError(f"Unknown architecture_style: {architecture_style}")
+model_config = get_config(depth=depth, vocab_size=vocab_size, sequence_len=max_seq_len)
+print0(f"Using GhostVis config (depth={depth}, SwiGLU + GQA + fused kernels)")
 
 # Apply MoE settings (kept here so they can be CLI-overridden via configurator.py)
 model_config.moe_num_experts = moe_num_experts

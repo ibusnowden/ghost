@@ -131,8 +131,7 @@ python -c "import pyarrow, tokenizers, tiktoken, rustbpe; print('Deps OK: pyarro
 # ---------------------------------------------------------------------------
 # Training knobs (override via sbatch --export=VAR=VALUE,...)
 
-ARCH_STYLE="${ARCH_STYLE:-qwen25_small}"   # qwen25_small|qwen25_1.5b|qwen25_7b|original
-DEPTH="${DEPTH:-4}"                       # used by qwen25_small/original
+DEPTH="${DEPTH:-32}"                      # transformer depth (scales model size)
 MODEL_TAG="${MODEL_TAG:-realdata_short}"
 SKIP_CORE_METRIC="${SKIP_CORE_METRIC:-1}" # 0 requires eval_bundle + pandas/yaml
 SKIP_SAMPLING="${SKIP_SAMPLING:-0}"       # 0 will sample prompts using tokenizer/Engine
@@ -156,7 +155,7 @@ EVAL_TOKENS="${EVAL_TOKENS:-$TOTAL_BATCH_SIZE}"
 
 echo ""
 echo "Run config:"
-echo "  ARCH_STYLE=$ARCH_STYLE DEPTH=$DEPTH MODEL_TAG=$MODEL_TAG"
+echo "  DEPTH=$DEPTH MODEL_TAG=$MODEL_TAG"
 echo "  MOE_NUM_EXPERTS=$MOE_NUM_EXPERTS MOE_TOP_K=$MOE_TOP_K MOE_LAYER_STRIDE=$MOE_LAYER_STRIDE"
 echo "  MAX_SEQ_LEN=$MAX_SEQ_LEN DEVICE_BATCH_SIZE=$DEVICE_BATCH_SIZE TOTAL_BATCH_SIZE=$TOTAL_BATCH_SIZE"
 echo "  NUM_ITERS=$NUM_ITERS EVAL_TOKENS=$EVAL_TOKENS"
@@ -177,7 +176,6 @@ fi
 
 "${LAUNCHER[@]}" -m scripts.base_train -- \
   --run="${WANDB_RUN_BASE}_${MODEL_TAG}" \
-  --architecture_style="$ARCH_STYLE" \
   --depth="$DEPTH" \
   --max_seq_len="$MAX_SEQ_LEN" \
   --device_batch_size="$DEVICE_BATCH_SIZE" \

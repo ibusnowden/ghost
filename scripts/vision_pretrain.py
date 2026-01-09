@@ -38,10 +38,8 @@ import torch.distributed as dist
 # Configuration
 run = "dummy"  # wandb run name ("dummy" = no wandb logging)
 source = "base"  # Load from base_checkpoints (text-only model)
-model_tag = None  # Model tag to load
 step = None  # Step to load from
-architecture_style = "vlm_small"  # Vision-language model config
-depth = 20  # For vlm_small
+depth = 32  # Transformer depth (scales model size)
 data_recipe = "vision_pretrain"  # Use vision_pretrain recipe (COCO captions)
 dtype = "bfloat16"
 device_batch_size = 16  # Lower than text training (images are memory-heavy)
@@ -86,14 +84,9 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="ghostvis-vi
 
 # Load base model and convert to VLM
 print0(f"Loading {source} model and adding vision modules...")
-if architecture_style == "vlm_1.5b":
-    from nanochat.model_configs import get_vlm_1_5b_config
-    vlm_config = get_vlm_1_5b_config()
-elif architecture_style == "vlm_small":
-    from nanochat.model_configs import get_vlm_small_config
-    vlm_config = get_vlm_small_config(depth=depth)
-else:
-    raise ValueError(f"Unknown architecture_style: {architecture_style}")
+from nanochat.model_configs import get_vlm_config
+vlm_config = get_vlm_config(depth=depth)
+print0(f"Using GhostVis VLM config (depth={depth}, SwiGLU + GQA + vision)")
 
 # Create VLM model (includes vision modules)
 from nanochat.gpt import GPT
@@ -332,7 +325,7 @@ while step_idx < total_steps:
     # Save checkpoint
     if step_idx > 0 and step_idx % save_every == 0 and master_process and not dry_run:
         print0(f"Saving checkpoint at step {step_idx}...")
-        checkpoint_dir = get_base_dir() / "mid_checkpoints" / architecture_style
+        checkpoint_dir = get_base_dir() / "mid_checkpoints" / f"d{depth}"
         save_checkpoint(
             ddp_rank,
             model,
@@ -348,7 +341,7 @@ while step_idx < total_steps:
 # Final checkpoint
 if master_process and not dry_run:
     print0(f"Saving final checkpoint at step {step_idx}...")
-    checkpoint_dir = get_base_dir() / "mid_checkpoints" / architecture_style
+    checkpoint_dir = get_base_dir() / "mid_checkpoints" / f"d{depth}"
     save_checkpoint(
         ddp_rank,
         model,
