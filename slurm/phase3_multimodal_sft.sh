@@ -2,13 +2,30 @@
 #SBATCH --job-name=ghostvis-sft
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=48
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
-#SBATCH --output=sft_%j.out
-#SBATCH --error=sft_%j.err
+#SBATCH --time=04:00:00
+#SBATCH --output=multimodal_sft_%j.out
+#SBATCH --error=multimodal_sft_%j.err
 #
-# Phase 3: Multimodal SFT - trains last N LLM layers + projector.
+# =============================================================================
+# Phase 3: Multimodal Supervised Fine-Tuning
+# =============================================================================
+#
+# Training Data (Mixed):
+#   - VQAv2: ~440K visual question-answer pairs
+#   - TextVQA: ~34K text-in-image QA pairs
+#   - COCO Captions: ~100K image-caption pairs
+#   - SmolTalk: ~1M high-quality chat conversations
+#   - OpenThoughts (optional): ~1.2M reasoning chains
+#
+# Data Recipe Options:
+#   - vision_sft: VQAv2 + TextVQA + COCO (vision-focused)
+#   - r1_ot_mixed: OpenThoughts + SmolTalk + GSM8K (reasoning-focused)
+#
+# Trainable Parameters: Last 4 LLM layers + Projector + Resampler
+# Frozen: Vision encoder + first N-4 LLM layers
 
 set -euo pipefail
 

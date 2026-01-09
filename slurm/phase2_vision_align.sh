@@ -2,14 +2,26 @@
 #SBATCH --job-name=ghostvis-mid
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
-#SBATCH --time=04:00:00
-#SBATCH --output=vision_mid_%j.out
-#SBATCH --error=vision_mid_%j.err
+#SBATCH --time=03:00:00
+#SBATCH --output=vision_align_%j.out
+#SBATCH --error=vision_align_%j.err
 #
-# Phase 2: Vision alignment - trains projector + resampler only.
+# =============================================================================
+# Phase 2: Vision-Language Alignment
+# =============================================================================
+#
+# Training Data:
+#   - Dataset: COCO Captions 2017 (HuggingFace: HuggingFaceM4/COCO)
+#   - Size: ~100K image-text pairs
+#   - Content: Natural images with human-written captions
+#   - Purpose: Align SigLIP vision features with LLM embedding space
+#
+# Vision Encoder: SigLIP ViT-L/14 (frozen, 336x336 images)
+# Trainable Parameters: Perceiver Resampler + MLP Projector only (~50M params)
+# Frozen: LLM backbone + Vision encoder
 
 set -euo pipefail
 

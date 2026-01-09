@@ -1,15 +1,50 @@
 #!/bin/bash
-#SBATCH --job-name=nanochat-r1-grpo
+#SBATCH --job-name=ghostvis-grpo
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
-#SBATCH --nodelist=itiger01
-#SBATCH --output=r1_grpo_%j.out
-#SBATCH --error=r1_grpo_%j.err
+#SBATCH --time=06:00:00
+#SBATCH --output=grpo_rl_%j.out
+#SBATCH --error=grpo_rl_%j.err
 #
-# Phase 2: Mixed-task GRPO (JustRL recipe defaults).
+# =============================================================================
+# Phase 4: GRPO Reinforcement Learning (Optional)
+# =============================================================================
+#
+# Training Data (Vision + Reasoning Task Mix):
+#   Vision Tasks:
+#   - VQAv2-RL: Visual QA with verifiable answers (~40K subset)
+#   - ChartQA: Chart understanding with exact match (~18K)
+#   - DocVQA: Document understanding (~10K)
+#
+#   Reasoning Tasks:
+#   - GSM8K: Grade school math word problems (~7.5K)
+#   - MATH: Competition math problems (~12K)
+#   - MBPP: Python programming problems (~1K)
+#
+# Default Task Mix: vqav2:0.3, chartqa:0.2, gsm8k:0.25, math:0.15, mbpp:0.1
+#
+# Reward Mode: DAPO (Dynamic Advantage Policy Optimization)
+# Trainable Parameters: Full model (unfrozen for RL)
+#
+# =============================================================================
+# Evaluation Tasks (run separately with scripts/eval.py)
+# =============================================================================
+#
+# Vision Benchmarks (Primary):
+#   - VQAv2 (val): Visual question answering accuracy
+#   - TextVQA (val): Text-in-image reading comprehension
+#   - ChartQA (test): Chart/graph understanding
+#   - DocVQA (val): Document understanding
+#   - MMMU (val): Multimodal multitask understanding
+#
+# Reasoning Benchmarks (Secondary):
+#   - GSM8K (test): Grade school math
+#   - MATH (test): Competition math
+#
+# Run: python -m scripts.eval --source=sft --depth=32 --tasks=vqav2,textvqa,chartqa,docvqa,mmmu
 
 set -euo pipefail
 

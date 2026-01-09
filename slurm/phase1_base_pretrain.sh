@@ -1,22 +1,32 @@
 #!/bin/bash
-#SBATCH --job-name=nanochat-realdata
-#SBATCH --nodes=1
+#SBATCH --job-name=ghostvis-base
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:rtx_6000:4
-#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=300G
-
-#SBATCH --output=realdata_%j.out
-#SBATCH --error=realdata_%j.err
+#SBATCH --time=06:00:00
+#SBATCH --output=base_pretrain_%j.out
+#SBATCH --error=base_pretrain_%j.err
 #
-# iTiger single-node short real-data base pretrain + eval.
-# Assumes you've already staged:
+# =============================================================================
+# Phase 1: Base Language Model Pretraining
+# =============================================================================
+#
+# Training Data:
+#   - Dataset: FineWeb-Edu (HuggingFace: HuggingFaceFW/fineweb-edu)
+#   - Size: ~40B tokens across 800 parquet shards
+#   - Content: High-quality educational web text
+#   - Format: Tokenized parquet files with rust BPE tokenizer
+#
+# Trainable Parameters: Full model (~1.5B for depth=32)
+#
+# Prerequisites:
 #   $NANOCHAT_BASE_DIR/tokenizer/{tokenizer.pkl,token_bytes.pt}
-#   $NANOCHAT_BASE_DIR/base_data/*.parquet   (need >=2 shards: train+val)
+#   $NANOCHAT_BASE_DIR/base_data/*.parquet (need >=2 shards: train+val)
 #
 # Usage:
-#   sbatch slurm/itiger_realdata_base_train_short.sbatch
+#   sbatch slurm/phase1_base_pretrain.sh
 #
 
 set -euo pipefail

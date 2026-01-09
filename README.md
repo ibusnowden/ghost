@@ -76,7 +76,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
 
 **SLURM:**
 ```bash
-# slurm/itiger_realdata_base_train_short.sh
+# slurm/phase1_base_pretrain.sh
 #!/bin/bash
 #SBATCH --job-name=ghostvis-base
 #SBATCH --nodes=1
@@ -95,7 +95,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
     --run=base_d32 \
     --device_batch_size=32
 
-# Submit: sbatch slurm/itiger_realdata_base_train_short.sh
+# Submit: sbatch slurm/phase1_base_pretrain.sh
 ```
 
 **Config:**
@@ -121,7 +121,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- \
 
 **SLURM:**
 ```bash
-# slurm/itiger_realdata_mid_train.sh
+# slurm/phase2_vision_align.sh
 #!/bin/bash
 #SBATCH --job-name=ghostvis-mid
 #SBATCH --nodes=1
@@ -141,7 +141,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- \
     --run=vision_align_d32 \
     --device_batch_size=16
 
-# Submit: sbatch slurm/itiger_realdata_mid_train.sh
+# Submit: sbatch slurm/phase2_vision_align.sh
 ```
 
 **Config:**
@@ -171,7 +171,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
 
 **SLURM:**
 ```bash
-# slurm/itiger_r1_ot_sft.sh
+# slurm/phase3_multimodal_sft.sh
 #!/bin/bash
 #SBATCH --job-name=ghostvis-sft
 #SBATCH --nodes=1
@@ -193,7 +193,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
     --data_recipe=vision_sft \
     --unfreeze_llm_layers=4
 
-# Submit: sbatch slurm/itiger_r1_ot_sft.sh
+# Submit: sbatch slurm/phase3_multimodal_sft.sh
 ```
 
 **Config:**
@@ -222,7 +222,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_grpo -- \
 
 **SLURM:**
 ```bash
-# slurm/itiger_r1_grpo.sh
+# slurm/phase4_grpo_rl.sh
 #!/bin/bash
 #SBATCH --job-name=ghostvis-grpo
 #SBATCH --nodes=1
@@ -243,7 +243,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_grpo -- \
     --device_batch_size=4 \
     --reward_mode=dapo
 
-# Submit: sbatch slurm/itiger_r1_grpo.sh
+# Submit: sbatch slurm/phase4_grpo_rl.sh
 ```
 
 **Config:**
@@ -297,7 +297,7 @@ print(outputs[0])
 ### SLURM Inference Job
 
 ```bash
-# slurm/itiger_chat_infer.sh
+# slurm/inference.sh
 #!/bin/bash
 #SBATCH --job-name=ghostvis-infer
 #SBATCH --nodes=1
@@ -317,22 +317,107 @@ python -m scripts.sglang_inference \
     --benchmark \
     --num-prompts=100
 
-# Submit: sbatch slurm/itiger_chat_infer.sh
+# Submit: sbatch slurm/inference.sh
+```
+
+---
+
+## Training Data Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           GhostVis Training Data Flow                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Phase 1: Base Pretraining (Text-Only)                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  FineWeb-Edu (HuggingFaceFW/fineweb-edu)                            │    │
+│  │  • ~40B tokens across 800 parquet shards                            │    │
+│  │  • High-quality educational web text                                │    │
+│  │  • Tokenized with rust BPE (65K vocab)                              │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              ↓                                              │
+│  Phase 2: Vision Alignment                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  COCO Captions 2017 (HuggingFaceM4/COCO)                            │    │
+│  │  • ~100K image-text pairs                                           │    │
+│  │  • Natural images with human captions                               │    │
+│  │  • SigLIP ViT-L/14 vision encoding (336x336)                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              ↓                                              │
+│  Phase 3: Multimodal SFT                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Vision-focused (vision_sft recipe):                                │    │
+│  │  • VQAv2: ~440K visual QA pairs                                     │    │
+│  │  • TextVQA: ~34K text-in-image QA pairs                             │    │
+│  │  • COCO Captions: ~100K image-caption pairs                         │    │
+│  │                                                                     │    │
+│  │  Reasoning-focused (r1_ot_mixed recipe):                            │    │
+│  │  • OpenThoughts: ~1.2M reasoning chains                             │    │
+│  │  • SmolTalk: ~1M chat conversations                                 │    │
+│  │  • GSM8K: ~7.5K math word problems                                  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              ↓                                              │
+│  Phase 4: GRPO RL (Optional)                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Vision Tasks (verifiable rewards):                                 │    │
+│  │  • VQAv2-RL: Visual QA with exact match (~40K)                      │    │
+│  │  • ChartQA: Chart understanding (~18K)                              │    │
+│  │  • DocVQA: Document understanding (~10K)                            │    │
+│  │                                                                     │    │
+│  │  Reasoning Tasks:                                                   │    │
+│  │  • GSM8K: Grade school math (~7.5K)                                 │    │
+│  │  • MATH: Competition math (~12K)                                    │    │
+│  │  • MBPP: Python programming (~1K)                                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Pipeline Summary
 
-| Phase | Script | Time | Cost | Trainable |
-|-------|--------|------|------|-----------|
-| **1. Base** | `scripts.base_train` | 4-6h | $100-150 | Full model |
-| **2. Mid** | `scripts.vision_pretrain` | 2-3h | $50-75 | Projector + Resampler |
-| **3. SFT** | `scripts.chat_sft` | 3-4h | $75-100 | Last 4 layers + Projector |
-| **4. RL** | `scripts.chat_grpo` | 4-6h | $100-150 | Full model |
+| Phase | Script | Time | Cost | Trainable | Data |
+|-------|--------|------|------|-----------|------|
+| **1. Base** | `scripts.base_train` | 4-6h | $100-150 | Full model | FineWeb-Edu (40B tokens) |
+| **2. Mid** | `scripts.vision_pretrain` | 2-3h | $50-75 | Projector + Resampler | COCO (100K pairs) |
+| **3. SFT** | `scripts.chat_sft` | 3-4h | $75-100 | Last 4 layers + Projector | VQAv2 + TextVQA + SmolTalk |
+| **4. RL** | `scripts.chat_grpo` | 4-6h | $100-150 | Full model | VQAv2 + ChartQA + GSM8K |
 
 **Total**: ~13-19 hours, ~$325-475 for full pipeline
 **Skip Phase 1**: ~9-13 hours, ~$225-325 if reusing text checkpoint
+
+---
+
+## Evaluation Benchmarks
+
+Run evaluation after any training phase:
+
+```bash
+# Primary vision benchmarks (recommended)
+python -m scripts.eval --source=sft --depth=32 --tasks=vqav2,textvqa,chartqa,docvqa,mmmu
+
+# Optional reasoning benchmarks
+python -m scripts.eval --source=sft --depth=32 --tasks=gsm8k,math
+```
+
+### Vision Benchmarks (Primary)
+
+| Benchmark | Description | Metric | Split |
+|-----------|-------------|--------|-------|
+| **VQAv2** | Visual question answering | Accuracy | val |
+| **TextVQA** | Text-in-image reading | Accuracy | val |
+| **ChartQA** | Chart/graph understanding | Relaxed Acc | test |
+| **DocVQA** | Document understanding | ANLS | val |
+| **MMMU** | Multimodal multitask understanding | Accuracy | val |
+
+### Reasoning Benchmarks (Secondary)
+
+| Benchmark | Description | Metric | Split |
+|-----------|-------------|--------|-------|
+| **GSM8K** | Grade school math | Accuracy | test |
+| **MATH** | Competition math | Accuracy | test |
 
 ---
 
