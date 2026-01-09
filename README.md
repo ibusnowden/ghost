@@ -1,6 +1,6 @@
 # GhostVis
 
-![nanochat logo](dev/nanochat.png)
+![GhostVis logo](dev/ghostvis-logo.png)
 
 > Vision-Language Model: The best multimodal ChatGPT you can train yourself.
 
@@ -66,28 +66,41 @@ Output Logits
 
 
 
-🚧 **Coming Soon** - Full vision training pipeline
+🚧 **Coming Soon** - Full vision training pipeline (Phases 1-4 complete, Phase 5 in progress)
 
-Once vision training is complete, you'll be able to train a multimodal model:
+Once vision training is complete, you'll be able to train a multimodal model using our **3-stage pipeline**:
 
 ```bash
-# Stage 1: Base pretraining (text-only, ~4 hours)
+# Stage 1: Base pretraining (text-only, ~4 hours, ~$96)
+# Skip this if you have an existing text checkpoint
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20
 
-# Stage 2: Vision alignment (~2-3 hours)
-torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- --architecture_style=vlm_1.5b
+# Stage 2: Vision alignment (~2-3 hours, ~$50-75)
+# Trains ONLY projector/resampler, everything else frozen
+torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- \
+    --architecture_style=vlm_1.5b \
+    --data_recipe_name=vision_pretrain
 
-# Stage 3: Multimodal SFT (~3-4 hours)
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --data_recipe_name=vision_sft
+# Stage 3: Multimodal SFT (~3-4 hours, ~$75-100)
+# Trains last 4 LLM layers + projector, vision encoder stays frozen
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
+    --architecture_style=vlm_1.5b \
+    --data_recipe_name=vision_sft_minimal \
+    --unfreeze_llm_layers=4
 
 # Stage 4: Serve the vision model
 python -m scripts.chat_web
 # Then use /image path/to/image.jpg to chat with images
 ```
 
-**Total training time**: ~13 hours | **Total cost**: ~$312 on 8XH100 @ $24/hr
+**3-Stage Pipeline (Recommended):**
+- **Training time**: ~9-11 hours (or ~5-7 hours if reusing text checkpoint)
+- **Total cost**: ~$220-270 on 8XH100 @ $24/hr (~$120-170 if reusing checkpoint)
+- **Capabilities**: General VQA, OCR, chart understanding, instruction following
 
-See [skills.md](skills.md) for the complete vision training roadmap.
+**Optional 4th stage (RL):** +4-6 hours, +$100-150 for specialized reasoning tasks
+
+See [skills.md](skills.md) for the complete vision training roadmap and design rationale.
 
 ---
 

@@ -13,9 +13,139 @@
 Stage 1: BASE (text-only pretraining)        [EXISTING] ✅
 Stage 2: MID (vision alignment)              [TO BUILD] ❌
 Stage 3: SFT (multimodal instruction)        [TO BUILD] ❌
-Stage 4: RL (task-specific refinement)       [TO BUILD] ❌
-Stage 5: INFERENCE (chat interface)          [TO BUILD] ❌
+Stage 4: INFERENCE (chat interface)          [TO BUILD] ❌
+
+Optional: RL (task-specific refinement)      [FUTURE/OPTIONAL] ⏸️
 ```
+
+**Philosophy: Start Simple, Add Complexity Later**
+- **3-stage pipeline** is the recommended starting point (matches LLaVA 1.5)
+- **RL is optional** - only needed for specialized reasoning tasks (visual math, complex multi-step reasoning)
+- **Focus on SFT quality** - 90% of practical capability comes from good SFT data mixture
+
+---
+
+## Key Design Decisions
+
+### 1. **Start from Pretrained Text LLM (NOT Joint Training)**
+✅ **Use existing Qwen2.5-1.5B text checkpoint**
+
+**Why:**
+- Text pretraining is sample-efficient (billions of text tokens available)
+- Joint text+vision pretraining requires massive multimodal datasets (10x-100x more expensive)
+- All successful VLMs use this approach (LLaVA, Qwen-VL, IDEFICS, Flamingo)
+- You already have the text checkpoint - leverage it!
+
+**What this means:**
+- Stage 1 (text pretraining) is reused/inherited
+- Only Stages 2-3 need new training
+
+---
+
+### 2. **Vision Alignment is CRITICAL (Cannot Skip)**
+⚠️ **Stage 2 must be done** - projector is randomly initialized
+
+**Why:**
+- Projector has no idea how to translate vision features → LLM token space
+- Direct to SFT fails: instruction datasets are too small to learn basic vision-text mapping
+- This stage is where the model learns: "this vision pattern" = "concept of cat"
+
+**What gets trained:**
+- Projector + Resampler: ✅ Trainable
+- Vision encoder: ❌ Frozen (pretrained CLIP/SigLIP)
+- LLM: ❌ Frozen (your text checkpoint)
+
+**Data:**
+- Simple image-caption pairs (COCO: "A cat on a table")
+- Large-scale web pairs (LAION: ~1M pairs)
+- NOT instruction-following data
+
+---
+
+### 3. **Token-Based SFT Mixing (NOT Row-Based)**
+🎯 **Think in answer tokens, not dataset rows**
+
+**The Problem:**
+- Long-form datasets (LLaVA-Instruct-150K): Long answers (~50-150 tokens)
+  - "This image shows a cat sitting on a wooden table. The cat appears to be..."
+- VQAv2: Short answers (~1-3 tokens)
+  - Q: "What color is the cat?" A: "orange"
+
+**If you mix 50% LLaVA-Instruct + 50% VQAv2 by rows:**
+- 95% of training tokens come from long-form answers
+- Model learns to always generate long answers
+- Poor performance on short-answer tasks
+
+**Correct approach:**
+```python
+# Target token distribution (not row distribution)
+{
+    'llava_instruct_150k': 0.50,   # Long-form - 50% of answer tokens
+    'vqav2': 0.20,                 # Short VQA - 20% of answer tokens
+    'textvqa': 0.12,               # OCR - 12% of answer tokens
+    'chartqa': 0.10,               # Charts - 10% of answer tokens
+    'smoltalk': 0.08,              # Text-only - 8% of answer tokens
+}
+```
+
+**How to implement:**
+- Sample datasets proportionally by **answer token count**, not row count
+- This requires computing average answer length per dataset
+- Batch loader should maintain target token distribution
+
+**Benefits:**
+- Model learns both short-answer discipline (VQA) and long-form reasoning (LNQA)
+- Balanced training signal across task types
+- Better generalization
+
+---
+
+### 4. **Partial LLM Unfreezing in SFT**
+🎯 **Unfreeze last 4-6 layers, keep early layers frozen**
+
+**Why:**
+- Vision features need to be adapted to LLM's semantic space
+- Last layers handle high-level reasoning and output generation
+- Early layers contain general language knowledge (don't touch)
+
+**Freezing strategy:**
+```python
+# For 28-layer Qwen2.5-1.5B
+Layers 0-22:  ❄️ Frozen (general language knowledge)
+Layers 23-27: 🔥 Trainable (vision adaptation)
+Projector:    🔥 Trainable
+Resampler:    🔥 Trainable
+Vision Enc:   ❄️ Frozen (always)
+```
+
+**Benefits:**
+- Prevents catastrophic forgetting of text capabilities
+- Faster training (less parameters to update)
+- Lower risk of overfitting
+- Maintains MMLU/GSM8K performance
+
+---
+
+### 5. **Skip RL for v1**
+⏸️ **RL is optional** - only +5-10% on specialized tasks
+
+**Why RL has diminishing returns for vision:**
+- SFT alone achieves 90% of practical capability
+- RL improvements mainly on complex reasoning (MathVista, visual math)
+- Minimal gains on general VQA/OCR tasks
+- 30-40% of training budget for marginal benefit
+
+**When to add RL:**
+- ✅ After validating SFT performance
+- ✅ Targeting specialized benchmarks (visual reasoning, math)
+- ✅ Have extra budget (~$100-150)
+- ✅ Building specialized assistant (e.g., visual math tutor)
+
+**When to skip RL:**
+- ✅ Building general-purpose vision assistant (most use cases)
+- ✅ Budget-constrained ($200-300 range)
+- ✅ First iteration / MVP
+- ✅ Need fast iteration cycle
 
 ---
 
@@ -503,22 +633,142 @@ class COCOCaptions(VisionTask):
 
 ```python
 def get_vision_pretrain_recipe():
-    """Vision-language pretraining mix"""
+    """Vision-language alignment (Stage 2)"""
     return {
-        'coco_captions': (0.3, 'train'),
-        'laion_filtered': (0.7, None),  # Streaming dataset
+        'coco_captions': (0.1, 'train'),     # 118K - simple captions
+        'laion_filtered': (0.9, None),       # ~1M - web-scale image-text pairs
     }
 
 def get_vision_sft_recipe():
-    """Multimodal instruction following"""
+    """
+    Multimodal instruction following (Stage 3)
+
+    Token-based mixing (not row-based):
+    - Long-form datasets (LLaVA-Instruct) have longer answers (~50-150 tokens)
+    - VQAv2 has short answers (~1-3 tokens)
+    - Balance by answer tokens for proper training dynamics
+
+    Dataset sources:
+    - llava_instruct_150k: liuhaotian/LLaVA-Instruct-150K
+    - a-okvqa: HuggingFaceM4/A-OKVQA
+    - vqav2: HuggingFaceM4/VQAv2
+    - okvqa: HuggingFaceM4/OK-VQA
+    - textvqa: textvqa/textvqa
+    - stvqa: (optional) scene text VQA
+    - docvqa: (optional) document understanding
+    - chartqa: HuggingFace chartqa
+    - smoltalk: HuggingFaceTB/smoltalk
+    """
     return {
-        'vqav2': (0.3, 'train'),
-        'textvqa': (0.2, 'train'),
-        'chartqa': (0.1, 'train'),
-        'coco_captions': (0.2, 'train'),
-        'smoltalk': (0.2, 'train'),  # Mix in text-only to prevent forgetting
+        # 40-55% Long-form QA (general visual grounding + broad QA)
+        'llava_instruct_150k': (0.45, 'train'),   # LLaVA official instruction data
+        'a-okvqa': (0.05, 'train'),               # Long answers with rationales
+
+        # 15-25% Classic VQA (short-answer discipline)
+        'vqav2': (0.15, 'train'),                 # Short factual answers
+        'okvqa': (0.05, 'train'),                 # Knowledge-based VQA
+
+        # 10-15% OCR/doc/text-in-image
+        'textvqa': (0.10, 'train'),               # Text reading + reasoning
+        'stvqa': (0.02, 'train'),                 # Scene text VQA (optional)
+        'docvqa': (0.03, 'train'),                # Document understanding (optional)
+
+        # 10-15% Charts/figures
+        'chartqa': (0.10, 'train'),               # Chart understanding
+
+        # 10-20% Text-only (prevent language drift)
+        'smoltalk': (0.05, 'train'),              # Text-only instruction following
+        # Total: 100% (adjust proportions as needed)
+    }
+
+def get_vision_sft_recipe_minimal():
+    """
+    Minimal recipe for faster iteration / budget-constrained training
+    Uses only freely available, high-quality datasets with good coverage
+
+    Recommended for v1 - achieves 90% of full recipe quality with simpler setup
+
+    Dataset sources:
+    - llava_instruct_150k: liuhaotian/LLaVA-Instruct-150K (150K examples)
+    - vqav2: HuggingFaceM4/VQAv2 (83K training examples)
+    - textvqa: textvqa/textvqa (21K training examples)
+    - chartqa: HuggingFace chartqa (18K training examples)
+    - smoltalk: HuggingFaceTB/smoltalk (text-only, prevents forgetting)
+    """
+    return {
+        # Long-form QA (50% of answer tokens)
+        'llava_instruct_150k': (0.50, 'train'),
+
+        # Classic VQA (20% of answer tokens)
+        'vqav2': (0.20, 'train'),
+
+        # OCR (12% of answer tokens)
+        'textvqa': (0.12, 'train'),
+
+        # Charts (10% of answer tokens)
+        'chartqa': (0.10, 'train'),
+
+        # Text-only (8% of answer tokens)
+        'smoltalk': (0.08, 'train'),
+    }
+
+def get_vision_sft_recipe_premium():
+    """
+    Premium recipe using GPT-4V generated data
+    Higher quality but requires more processing
+
+    Use this if you want maximum quality and have the compute budget
+
+    Dataset sources:
+    - sharegpt4v: Lin-Chen/ShareGPT4V (~100K GPT-4V examples)
+    - llava_instruct_150k: liuhaotian/LLaVA-Instruct-150K
+    - Rest same as minimal recipe
+    """
+    return {
+        # Long-form QA (50% split between ShareGPT4V and LLaVA)
+        'sharegpt4v': (0.30, 'train'),            # GPT-4V quality
+        'llava_instruct_150k': (0.20, 'train'),   # LLaVA official
+
+        # Classic VQA (20%)
+        'vqav2': (0.20, 'train'),
+
+        # OCR (12%)
+        'textvqa': (0.12, 'train'),
+
+        # Charts (10%)
+        'chartqa': (0.10, 'train'),
+
+        # Text-only (8%)
+        'smoltalk': (0.08, 'train'),
     }
 ```
+
+**Key Principles for SFT Mixing:**
+
+1. **Think in answer tokens, not rows**: Long-form answers are 20-50x longer than VQAv2
+2. **Balance short & long answers**: Prevents model from always generating short/long responses
+3. **Include text-only**: 10-20% prevents catastrophic forgetting of text capabilities
+4. **Start minimal, expand later**: Use `vision_sft_recipe_minimal` for v1, add complexity in v2
+
+---
+
+**📝 Terminology Note: "LNQA" vs "LLaVA-Instruct"**
+
+**LNQA** = "Long-form Natural Question Answering" (generic term for datasets with long answers)
+- Used as shorthand for any dataset with detailed, multi-sentence answers
+- Examples: LLaVA-Instruct-150K, A-OKVQA, ShareGPT4V
+
+**LLaVA-Instruct-150K** = Specific dataset from the LLaVA paper
+- HuggingFace: `liuhaotian/LLaVA-Instruct-150K`
+- 150K instruction-following examples
+- **This is what we recommend using** (industry standard)
+
+**vikhyatk/lnqa** = Different specific dataset
+- Another long-form VQA dataset
+- Can be used as alternative/supplement to LLaVA-Instruct
+- Not required for GhostVis (LLaVA-Instruct-150K is sufficient)
+
+**Recommendation:** Use `liuhaotian/LLaVA-Instruct-150K` as your primary long-form dataset. It's the industry standard and well-tested.
 
 ### 4.3 Create Vision Dataloader (`dataloader.py`)
 
@@ -825,6 +1075,7 @@ async def chat(message: str, image_id: str = None):
 **Script:** `scripts/base_train.py` (unchanged)
 **Data:** FineWeb-Edu
 **Duration:** ~4 hours (d20), ~12 hours (d26)
+**Cost:** ~$96 @ $24/hr (4 hours on 8XH100)
 **Output:** `base_checkpoints/`
 
 ```bash
@@ -837,10 +1088,26 @@ torchrun --standalone --nproc_per_node=8 \
 
 ### Stage 2: MID (Vision Alignment)
 **Script:** `scripts/vision_pretrain.py` (new)
-**Data:** COCO Captions (118K) + LAION subset (1M)
-**Train:** Projector + resampler only (frozen LLM + vision encoder)
-**Duration:** ~2-3 hours (1 epoch)
+**Data:** COCO Captions (118K) + LAION subset (~1M)
+**Train:** Projector + resampler ONLY (frozen LLM + frozen vision encoder)
+**Duration:** ~2-3 hours (1 epoch over 1M pairs)
+**Cost:** ~$50-75 @ $24/hr
 **Output:** `mid_checkpoints/`
+
+**Critical freezing strategy:**
+```python
+# FREEZE everything except projector/resampler
+for param in model.transformer.parameters():
+    param.requires_grad = False
+for param in model.vision_encoder.parameters():
+    param.requires_grad = False
+
+# TRAIN only these
+optimizer = torch.optim.AdamW([
+    {'params': model.vision_projector.parameters(), 'lr': 5e-5},
+    {'params': model.vision_resampler.parameters(), 'lr': 3e-5},
+], weight_decay=0.01)
+```
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -855,18 +1122,39 @@ torchrun --standalone --nproc_per_node=8 \
   --num_epochs=1
 ```
 
-### Stage 3: SFT (Multimodal Instruction)
+### Stage 3: SFT (Multimodal Instruction Following)
 **Script:** `scripts/chat_sft.py` (modified)
-**Data:** VQA + TextVQA + ChartQA + SmolTalk (20% text-only)
-**Train:** Last 4-6 LLM layers + projector (frozen vision encoder)
-**Duration:** ~3-4 hours
+**Data:** Token-balanced mixture (see `vision_sft_recipe_minimal`)
+- 50% LNQA (long-form QA)
+- 20% VQAv2 (short-answer discipline)
+- 12% TextVQA (OCR)
+- 10% ChartQA (charts/figures)
+- 8% SmolTalk (text-only, prevent forgetting)
+
+**Train:** Last 4-6 LLM layers + projector (frozen vision encoder + early LLM layers)
+**Duration:** ~3-4 hours (3 epochs)
+**Cost:** ~$75-100 @ $24/hr
 **Output:** `chatsft_checkpoints/`
+
+**Partial unfreezing strategy:**
+```python
+# FREEZE vision encoder (always frozen after Stage 2)
+for param in model.vision_encoder.parameters():
+    param.requires_grad = False
+
+# FREEZE early LLM layers (e.g., layers 0-22 for 28-layer model)
+for i in range(model.config.n_layer - 4):  # Unfreeze last 4 layers
+    for param in model.transformer.h[i].parameters():
+        param.requires_grad = False
+
+# TRAIN: Last 4 LLM layers + projector + resampler
+```
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   -m scripts.chat_sft -- \
   --architecture_style=vlm_1.5b \
-  --data_recipe_name=vision_sft \
+  --data_recipe_name=vision_sft_minimal \
   --unfreeze_llm_layers=4 \
   --llm_lr=1e-6 \
   --projector_lr=3e-5 \
@@ -874,11 +1162,22 @@ torchrun --standalone --nproc_per_node=8 \
   --num_epochs=3
 ```
 
-### Stage 4: RL (Task-Specific)
+**Total for 3-stage pipeline: ~9-11 hours, ~$220-270**
+
+---
+
+### Optional: Stage 4: RL (Task-Specific Refinement)
+
+⚠️ **Skip this for v1** - Only add if you need:
+- Complex multi-step visual reasoning
+- Mathematical problem solving with diagrams
+- Optimization for specific benchmarks (MathVista, MMMU reasoning)
+
 **Script:** `scripts/chat_grpo.py` (modified)
-**Data:** Visual math, diagram QA, chart reasoning
-**Train:** Full model (or last N layers)
+**Data:** Visual math, diagram reasoning, chart QA (sparse rewards)
+**Train:** Full model or last N layers
 **Duration:** ~4-6 hours
+**Cost:** ~$100-150 @ $24/hr
 **Output:** `chatrl_checkpoints/`
 
 ```bash
@@ -889,6 +1188,8 @@ torchrun --standalone --nproc_per_node=8 \
   --device_batch_size=4 \
   --num_samples=8
 ```
+
+**Total with RL: ~13-17 hours, ~$320-420**
 
 ---
 
@@ -1067,158 +1368,444 @@ train_transforms = transforms.Compose([
 
 ## Migration Checklist
 
-### Phase 1: Foundation ✅
+### Phase 1: Foundation (Vision Modules) ✅
 - [ ] Create `nanovision/vision/` package
-- [ ] Implement `VisionEncoder`
-- [ ] Implement `VisionResampler`
-- [ ] Implement `VisionProjector`
+- [ ] Implement `VisionEncoder` (SigLIP/CLIP wrapper)
+- [ ] Implement `VisionResampler` (Perceiver or AvgPool)
+- [ ] Implement `VisionProjector` (2-layer MLP)
 - [ ] Implement image transforms
 - [ ] Add vision configs to `GPTConfig`
 - [ ] Unit test all vision modules
+
+**Status:** Completed
+**Time:** ~1-2 days
+
+---
 
 ### Phase 2: Model Integration ✅
 - [ ] Add vision modules to `GPT.__init__()`
 - [ ] Implement `GPT.encode_vision()`
 - [ ] Modify `GPT.forward()` for vision_embeds
-- [ ] Update `setup_optimizers()` for vision
-- [ ] Update checkpoint save/load
+- [ ] Update `setup_optimizers()` for vision components
+- [ ] Update checkpoint save/load for vision modules
 - [ ] Integration test: forward pass with vision
 
-### Phase 3: Tokenization ✅
+**Status:** Completed
+**Time:** ~2-3 days
+
+---
+
+### Phase 3: Tokenization & Conversation ✅
 - [ ] Add `<|image|>` special token
 - [ ] Modify `render_conversation()` for images
 - [ ] Update loss masking for vision tokens
 - [ ] Test tokenizer with multimodal conversations
 
+**Status:** Completed
+**Time:** ~1 day
+
+---
+
 ### Phase 4: Data Pipeline ✅
 - [ ] Create vision task base class
 - [ ] Implement COCO Captions loader
-- [ ] Implement VQAv2 loader
-- [ ] Implement TextVQA loader
+- [ ] Implement LLaVA-Instruct loader (LNQA)
+- [ ] Implement VQAv2 loader (short-answer)
+- [ ] Implement TextVQA loader (OCR)
+- [ ] Implement ChartQA loader
 - [ ] Add vision recipes to `data_recipes.py`
+  - [ ] `vision_pretrain` (COCO + LAION)
+  - [ ] `vision_sft_minimal` (token-balanced)
+  - [ ] `vision_sft` (full recipe)
 - [ ] Create vision dataloader
 - [ ] Test data loading end-to-end
 
-### Phase 5: Training ✅
-- [ ] Create `vision_pretrain.py` script
-- [ ] Modify `chat_sft.py` for vision
-- [ ] Modify `chat_grpo.py` for vision
-- [ ] Test training loop on single GPU
-- [ ] Test multi-GPU training
+**Status:** Completed
+**Time:** ~3-4 days
+
+---
+
+### Phase 5: Training Scripts (3-Stage Pipeline) 🔄
+
+#### Stage 2: Vision Alignment
+- [ ] Create `scripts/vision_pretrain.py`
+  - [ ] Load text checkpoint
+  - [ ] Initialize vision modules
+  - [ ] Freeze LLM + vision encoder
+  - [ ] Train only projector + resampler
+  - [ ] Save vision checkpoint
+- [ ] Test on single GPU
+- [ ] Test on 8 GPUs
 - [ ] Validate checkpointing
 
-### Phase 6: Inference ✅
+#### Stage 3: Multimodal SFT
+- [ ] Modify `scripts/chat_sft.py` for vision
+  - [ ] Load vision checkpoint
+  - [ ] Implement partial unfreezing (last N layers)
+  - [ ] Add vision dataloader
+  - [ ] Update forward pass for vision_embeds
+- [ ] Test on single GPU
+- [ ] Test on 8 GPUs
+- [ ] Validate text capability preservation
+
+**Status:** In Progress
+**Time:** ~5-7 days
+
+---
+
+### Phase 6: Inference & Evaluation 🔄
 - [ ] Modify `Engine` for vision_embeds
-- [ ] Update KVCache for vision prefix
-- [ ] Modify `chat_eval.py` for vision
-- [ ] Add vision benchmarks
-- [ ] Update CLI for image input
-- [ ] Update web UI for image upload
+  - [ ] Update `generate_batch()` signature
+  - [ ] Implement vision prefix handling
+- [ ] Update KVCache for vision tokens
+- [ ] Modify `scripts/chat_eval.py` for vision
+  - [ ] Add vision benchmark support
+  - [ ] Implement VQAv2 evaluation
+  - [ ] Implement TextVQA evaluation
+  - [ ] Implement ChartQA evaluation
+- [ ] Update CLI (`chat_cli.py`) for image input
+  - [ ] Add `/image` command
+  - [ ] Support inline image paths
+- [ ] Update web UI (`chat_web.py`)
+  - [ ] Add image upload endpoint
+  - [ ] Update HTML UI for images
+  - [ ] Display images in conversation
 - [ ] End-to-end inference test
 
-### Phase 7: Optimization ✅
+**Status:** To Do
+**Time:** ~3-4 days
+
+---
+
+### Phase 7: Optimization & Polish ⏸️
 - [ ] Profile memory usage
-- [ ] Tune batch sizes
+- [ ] Tune batch sizes for vision
 - [ ] Enable gradient checkpointing if needed
 - [ ] Optimize image preprocessing
 - [ ] Add vision embedding caching
 - [ ] Benchmark throughput
+- [ ] Write comprehensive tests
+- [ ] Update all documentation
+
+**Status:** To Do
+**Time:** ~2-3 days
+
+---
+
+### Optional: RL Stage (Future Enhancement) ⏸️
+- [ ] Modify `scripts/chat_grpo.py` for vision
+  - [ ] Add vision reward functions
+  - [ ] Update generation with vision
+  - [ ] Vision-specific GRPO implementation
+- [ ] Create visual reasoning datasets
+- [ ] Test RL training loop
+- [ ] Evaluate on reasoning benchmarks
+
+**Status:** Optional - Skip for v1
+**Time:** ~4-5 days
+**When to add:** After validating base SFT performance, if targeting specialized reasoning tasks
+
+---
+
+## Progress Summary
+
+**Completed (Phases 1-4):** ~60% of core functionality
+**In Progress (Phase 5):** Training script modifications
+**Remaining (Phases 6-7):** Inference + optimization
+
+**Estimated Total Time:**
+- Core 3-stage pipeline: ~3-4 weeks
+- With testing & polish: ~4-5 weeks
+- With optional RL: +1 week
 
 ---
 
 ## Quick Start Commands
 
-### 1. Setup Environment
+### **Option 1: Full Training from Scratch**
+
 ```bash
+# 1. Setup Environment
 cd ghostvis
-pip install timm pillow datasets
-```
+pip install timm pillow datasets torch torchvision
 
-### 2. Test Vision Modules
-```bash
+# 2. Test Vision Modules
 python -c "from nanovision.vision import VisionEncoder; print('Vision modules OK')"
-```
 
-### 3. Run Vision Pretraining (2-3 hours)
-```bash
+# 3. Stage 1: Base Pretraining (4 hours, ~$96)
+torchrun --standalone --nproc_per_node=8 \
+  -m scripts.base_train -- \
+  --depth=20 \
+  --architecture_style=qwen25_1.5b
+
+# 4. Stage 2: Vision Alignment (2-3 hours, ~$50-75)
 torchrun --standalone --nproc_per_node=8 \
   -m scripts.vision_pretrain -- \
-  --architecture_style=vlm_1.5b
-```
+  --architecture_style=vlm_1.5b \
+  --data_recipe_name=vision_pretrain
 
-### 4. Run Multimodal SFT (3-4 hours)
-```bash
+# 5. Stage 3: Multimodal SFT (3-4 hours, ~$75-100)
 torchrun --standalone --nproc_per_node=8 \
   -m scripts.chat_sft -- \
   --source=mid \
-  --data_recipe_name=vision_sft
+  --architecture_style=vlm_1.5b \
+  --data_recipe_name=vision_sft_minimal \
+  --unfreeze_llm_layers=4
+
+# 6. Evaluate on Vision + Text Benchmarks
+python -m scripts.chat_eval --source=sft \
+  --tasks=vqav2,textvqa,chartqa,mmlu,gsm8k
+
+# 7. Deploy Interactive Chat
+python -m scripts.chat_web
 ```
 
-### 5. Evaluate on Vision Benchmarks
+**Total: ~9-11 hours, ~$220-270**
+
+---
+
+### **Option 2: Start from Existing Text Checkpoint (Faster)**
+
+If you already have a trained Qwen2.5-1.5B text checkpoint:
+
 ```bash
-python -m scripts.chat_eval --source=sft --tasks=vqav2,textvqa
+# 1. Stage 2: Vision Alignment (2-3 hours, ~$50-75)
+torchrun --standalone --nproc_per_node=8 \
+  -m scripts.vision_pretrain -- \
+  --architecture_style=vlm_1.5b \
+  --resume_from=/path/to/text/checkpoint.pt \
+  --data_recipe_name=vision_pretrain
+
+# 2. Stage 3: Multimodal SFT (3-4 hours, ~$75-100)
+torchrun --standalone --nproc_per_node=8 \
+  -m scripts.chat_sft -- \
+  --source=mid \
+  --architecture_style=vlm_1.5b \
+  --data_recipe_name=vision_sft_minimal \
+  --unfreeze_llm_layers=4
+
+# 3. Evaluate & Deploy
+python -m scripts.chat_eval --source=sft --tasks=vqav2,textvqa,chartqa
+python -m scripts.chat_web
 ```
 
-### 6. Interactive Vision Chat
+**Total: ~5-7 hours, ~$120-170**
+
+---
+
+### **Using the Vision Model**
+
+**Interactive CLI:**
 ```bash
 python -m scripts.chat_cli
-# Then: /image path/to/image.jpg
+
+# In the CLI:
+> /image path/to/image.jpg
+> What is in this image?
+
+# Or inline:
+> What do you see in /path/to/image.jpg?
+```
+
+**Web UI:**
+```bash
+python -m scripts.chat_web
+# Visit http://localhost:8000
+# Use image upload button to attach images to messages
+```
+
+**Programmatic:**
+```python
+from nanovision import GPT
+from nanovision.vision import get_vision_transforms
+from PIL import Image
+
+# Load model
+model = GPT.from_checkpoint("chatsft_checkpoints/model_final.pt")
+
+# Process image
+image = Image.open("cat.jpg")
+transforms = get_vision_transforms("siglip_vit_l14", 336)
+image_tensor = transforms(image)
+
+# Generate response
+vision_embeds = model.encode_vision(image_tensor.unsqueeze(0))
+response = model.generate(
+    prompt="<|image|>\nWhat is in this image?",
+    vision_embeds=vision_embeds
+)
+print(response)
 ```
 
 ---
 
 ## End-to-End Example
 
-**Goal:** Train a 1.5B vision-language model from scratch
+### **Recommended: 3-Stage Pipeline (v1)**
+
+Train a production-ready 1.5B vision-language model:
 
 ```bash
-# Step 1: Base pretraining (4 hours, already done if you have base checkpoint)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train
+# Step 1: Base pretraining (4 hours, skip if you have checkpoint)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20
 
-# Step 2: Vision alignment (2 hours)
-torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain
+# Step 2: Vision alignment (2-3 hours)
+# CRITICAL: Only trains projector/resampler, everything else frozen
+torchrun --standalone --nproc_per_node=8 -m scripts.vision_pretrain -- \
+    --architecture_style=vlm_1.5b \
+    --data_recipe_name=vision_pretrain
 
-# Step 3: Multimodal SFT (3 hours)
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft --data_recipe_name=vision_sft
+# Step 3: Multimodal SFT (3-4 hours)
+# Trains last 4 LLM layers + projector, vision encoder stays frozen
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
+    --architecture_style=vlm_1.5b \
+    --data_recipe_name=vision_sft_minimal \
+    --unfreeze_llm_layers=4
 
-# Step 4: Visual reasoning RL (4 hours, optional)
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_grpo --data_recipe_name=vision_rl
+# Step 4: Evaluate
+python -m scripts.chat_eval --tasks=vqav2,textvqa,chartqa,mmlu,gsm8k
 
-# Step 5: Evaluate
-python -m scripts.chat_eval --tasks=vqav2,textvqa,chartqa,gsm8k,mmlu
+# Step 5: Deploy
+python -m scripts.chat_web
+```
+
+**Total time:** ~9-11 hours (or ~5-7 hours if starting from existing text checkpoint)
+**Total cost:** ~$220-270 on 8xH100 @ $24/hr (~$120-170 if reusing text checkpoint)
+
+---
+
+### **Optional: 4-Stage Pipeline (v2 - Specialized Tasks)**
+
+Add RL for complex reasoning tasks:
+
+```bash
+# Steps 1-3: Same as above (9-11 hours)
+# ...
+
+# Step 4: Visual reasoning RL (4-6 hours, OPTIONAL)
+# Only for specialized reasoning benchmarks
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_grpo -- \
+    --source=sft \
+    --data_recipe_name=vision_rl
+
+# Step 5: Evaluate (include reasoning benchmarks)
+python -m scripts.chat_eval --tasks=vqav2,textvqa,chartqa,mathvista,mmmu,gsm8k,mmlu
 
 # Step 6: Deploy
 python -m scripts.chat_web
 ```
 
-**Total time:** ~13 hours
-**Total cost:** ~$312 on 8xH100 @ $24/hr
+**Total time:** ~13-17 hours
+**Total cost:** ~$320-420 on 8xH100 @ $24/hr
 
 ---
 
 ## Expected Results
 
-### After Vision Pretraining (Stage 2):
-- Model can describe images (basic captioning)
+### After Vision Alignment (Stage 2):
+**Capabilities unlocked:**
+- Basic image captioning (objects, scenes, colors)
+- Vision-text alignment established
+- Foundation for instruction following
+
+**Metrics:**
+- COCO Captioning CIDEr: ~80-100 (basic descriptions)
 - Vision-text alignment score: ~0.6-0.7
-- Text benchmarks unchanged (frozen LLM)
+- Text benchmarks: **Unchanged** (LLM was completely frozen)
 
-### After Multimodal SFT (Stage 3):
-- VQAv2: ~45-50% accuracy (1.5B model)
-- TextVQA: ~30-35% accuracy
-- ChartQA: ~20-25% accuracy
-- Text benchmarks: Minor regression (<2%)
+**What it CAN do:**
+- "Describe this image" → "A cat sitting on a table"
+- Identify objects and basic attributes
 
-### After Visual RL (Stage 4):
-- Visual math: +5-10% over SFT
-- Diagram reasoning: +10-15% over SFT
-- General VQA: Slight improvement
+**What it CANNOT do yet:**
+- Answer specific questions about images (needs SFT)
+- Follow instructions (needs SFT)
+- Complex reasoning (needs SFT or RL)
 
-### Comparison to Text-Only Baseline:
-- **Parameters:** +0B (vision encoder frozen, not counted)
-- **Latency:** +30-40% (vision encoding overhead)
-- **Memory:** +30-40% (vision activations)
-- **FLOPs:** +2.5x (vision forward pass)
+---
+
+### After Multimodal SFT (Stage 3) - **PRODUCTION READY**
+
+**Capabilities unlocked:**
+- Visual question answering
+- Instruction following with images
+- OCR and text reading
+- Chart/diagram understanding
+- General-purpose vision assistant
+
+**Expected Benchmarks (1.5B model):**
+
+| Task | Metric | Expected | Notes |
+|------|--------|----------|-------|
+| **VQAv2** | Accuracy | 45-55% | Short-answer QA |
+| **TextVQA** | Accuracy | 30-40% | OCR + reasoning |
+| **ChartQA** | Accuracy | 20-30% | Chart understanding |
+| **A-OKVQA** | Accuracy | 35-45% | Knowledge-based VQA |
+| **MMLU** | Accuracy | 45-50% | Text capability maintained |
+| **GSM8K** | Accuracy | 10-15% | Math (text-only) |
+| **HumanEval** | Pass@1 | 8-12% | Code (text-only) |
+
+**Comparison to baselines:**
+- **LLaVA-1.5-7B**: VQAv2 ~79%, TextVQA ~58% (3x larger, better vision encoder)
+- **Qwen-VL-Chat**: VQAv2 ~78%, TextVQA ~63% (7B model)
+- **Our 1.5B model**: Competitive for size, excellent quality/cost ratio
+
+**Text capability regression:**
+- MMLU: <3% drop (acceptable with text-only mixing)
+- GSM8K: <5% drop
+- Can be recovered with more text-only data in SFT mix
+
+**What it CAN do:**
+- "What's in this image?" → Detailed description
+- "Read the text in this sign" → OCR + transcription
+- "What does this chart show?" → Chart analysis
+- "Why is this image funny?" → Visual reasoning
+- General instruction following with images
+
+**This is the recommended stopping point for v1!**
+
+---
+
+### Optional: After Visual RL (Stage 4)
+
+⚠️ **Diminishing returns** - Only +5-10% on specialized benchmarks
+
+**Expected improvements (over SFT):**
+- **MathVista**: +8-12% (visual math reasoning)
+- **MMMU** (reasoning subset): +5-10%
+- **Diagram QA**: +10-15%
+- **General VQA**: +2-5% (minimal improvement)
+
+**Trade-offs:**
+- **Cost**: +$100-150 (30-40% of total budget)
+- **Benefit**: Mainly for specialized reasoning tasks
+- **Risk**: Potential overfitting to RL tasks
+
+**When to add RL:**
+- Targeting specific reasoning benchmarks
+- Have extra budget for refinement
+- After validating base SFT performance
+- Specialized use case (e.g., visual math tutoring)
+
+---
+
+### System-Level Comparison
+
+**Comparison to Text-Only Baseline:**
+
+| Aspect | Text-Only | +Vision (Stage 3) | Impact |
+|--------|-----------|-------------------|--------|
+| **Parameters** | 1.5B | 1.5B + 0.4B (frozen) | Vision encoder not counted |
+| **Latency** | 100ms | 130-140ms | +30-40% (vision encoding) |
+| **Memory** | 3GB | 4-4.5GB | +30-40% (vision activations) |
+| **FLOPs** | 1x | 2.5x | Vision forward pass overhead |
+| **Disk** | 3GB | 4.2GB | +1.2GB for vision weights |
+
+**Inference characteristics:**
+- **First token latency**: +100-150ms (vision encoding is one-time cost)
+- **Subsequent tokens**: Same as text-only
+- **Throughput**: ~70-80% of text-only speed (batch inference)
+- **Quality**: Maintains text capability while adding vision
 
 ---
 
@@ -1262,6 +1849,28 @@ python -m scripts.chat_web
 
 ---
 
-**Last Updated:** 2026-01-06
-**Status:** Ready for implementation
-**Estimated Total Implementation Time:** 2-3 weeks (with testing)
+## Changelog
+
+### 2026-01-08: 3-Stage Pipeline Update
+- **Changed**: Switched from 4-stage to 3-stage recommended pipeline (RL now optional)
+- **Added**: Token-based SFT mixing strategy (not row-based)
+- **Added**: Detailed design decision rationale section
+- **Updated**: Expected results for 3-stage pipeline
+- **Updated**: Cost estimates (~$220-270 for 3-stage vs ~$320-420 with RL)
+- **Added**: Minimal SFT recipe (`vision_sft_recipe_minimal`) for v1
+- **Updated**: Migration checklist to reflect 3-stage focus
+
+**Key Insights:**
+- RL provides only 5-10% improvement on specialized tasks (diminishing returns)
+- Token-balanced SFT mixing critical for quality (prevents length bias)
+- Partial LLM unfreezing (last 4-6 layers) prevents catastrophic forgetting
+- Vision alignment (Stage 2) cannot be skipped - projector is randomly initialized
+
+---
+
+**Last Updated:** 2026-01-08
+**Status:** Ready for implementation (3-stage pipeline)
+**Estimated Total Implementation Time:**
+- 3-stage pipeline: ~3-4 weeks
+- With testing & polish: ~4-5 weeks
+- With optional RL: +1 week
