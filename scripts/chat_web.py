@@ -31,6 +31,8 @@ Abuse Prevention:
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import re
@@ -45,10 +47,12 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
+from PIL import Image
 
 from nanochat.common import compute_init
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+from nanovision.vision.transforms import get_vision_transforms
 
 # Abuse prevention limits
 MAX_MESSAGES_PER_REQUEST = 500
@@ -105,6 +109,8 @@ class Worker:
     engine: Engine
     tokenizer: object
     autocast_ctx: torch.amp.autocast
+    vision_transforms: object = None  # Vision preprocessing transforms
+    has_vision: bool = False  # Whether model supports vision
 
 class WorkerPool:
     """Pool of workers, each with a model replica on a different GPU."""
@@ -126,12 +132,23 @@ class WorkerPool:
             engine = Engine(model, tokenizer)
             autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
+            # Check if model has vision capabilities
+            has_vision = hasattr(model, 'encode_vision') and model.vision_encoder is not None
+            vision_transforms = None
+            if has_vision:
+                encoder_name = getattr(model.config, 'vision_encoder_name', 'siglip_vit_l14')
+                image_size = getattr(model.config, 'vision_image_size', 336)
+                vision_transforms = get_vision_transforms(encoder_name, image_size, is_train=False)
+                print(f"  GPU {gpu_id}: Vision enabled ({encoder_name})")
+
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,
                 engine=engine,
                 tokenizer=tokenizer,
-                autocast_ctx=autocast_ctx
+                autocast_ctx=autocast_ctx,
+                vision_transforms=vision_transforms,
+                has_vision=has_vision
             )
             self.workers.append(worker)
             await self.available_workers.put(worker)
@@ -149,6 +166,7 @@ class WorkerPool:
 class ChatMessage(BaseModel):
     role: str
     content: str
+    image: Optional[str] = None  # Base64-encoded image data (e.g., "data:image/jpeg;base64,...")
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
@@ -156,6 +174,28 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
+
+
+def decode_base64_image(image_data: str) -> Optional[Image.Image]:
+    """
+    Decode a base64 image string to PIL Image.
+    Supports formats: "data:image/jpeg;base64,..." or raw base64 string.
+    """
+    try:
+        # Handle data URL format
+        if image_data.startswith("data:"):
+            # Extract base64 part after the comma
+            _, base64_data = image_data.split(",", 1)
+        else:
+            base64_data = image_data
+
+        # Decode base64
+        image_bytes = base64.b64decode(base64_data)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return image
+    except Exception as e:
+        logger.warning(f"Failed to decode image: {e}")
+        return None
 
 def validate_chat_request(request: ChatRequest):
     """Validate chat request to prevent abuse."""
@@ -273,7 +313,8 @@ async def generate_stream(
     temperature=None,
     max_new_tokens=None,
     top_k=None,
-    repetition_penalty=None
+    repetition_penalty=None,
+    vision_embeds=None
 ) -> AsyncGenerator[str, None]:
     """Generate assistant response with streaming."""
     temperature = temperature if temperature is not None else args.temperature
@@ -297,15 +338,18 @@ async def generate_stream(
     final_stop_char_limit = 300  # Increased for Dolci format answers
 
     with worker.autocast_ctx:
-        for token_column, token_masks in worker.engine.generate(
-            tokens,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            seed=random.randint(0, 2**31 - 1)
-        ):
+        generate_kwargs = {
+            "num_samples": 1,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "seed": random.randint(0, 2**31 - 1),
+        }
+        if vision_embeds is not None:
+            generate_kwargs["vision_embeds"] = vision_embeds
+
+        for token_column, token_masks in worker.engine.generate(tokens, **generate_kwargs):
             token = token_column[0]
 
             # Stopping criteria
@@ -377,7 +421,8 @@ async def chat_completions(request: ChatRequest):
     # Log incoming conversation to console
     logger.info("="*20)
     for i, message in enumerate(messages):
-        logger.info(f"[{message.role.upper()}]: {message.content}")
+        img_tag = " [+IMAGE]" if message.image else ""
+        logger.info(f"[{message.role.upper()}]{img_tag}: {message.content}")
     logger.info("-"*20)
 
     # Acquire a worker from the pool (will wait if all are busy)
@@ -392,11 +437,31 @@ async def chat_completions(request: ChatRequest):
         assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
         assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
 
+        # Process images and compute vision embeddings
+        vision_embeds = None
+        for message in messages:
+            if message.image and worker.has_vision:
+                image = decode_base64_image(message.image)
+                if image is not None:
+                    try:
+                        image_tensor = worker.vision_transforms(image).unsqueeze(0).to(worker.device)
+                        with torch.no_grad():
+                            vision_embeds = worker.engine.model.encode_vision(image_tensor)
+                        logger.info(f"Processed image: {image.size[0]}x{image.size[1]}")
+                    except Exception as e:
+                        logger.warning(f"Failed to encode image: {e}")
+                # Only use the last image in conversation
+                break
+
         conversation_tokens = [bos]
         for message in messages:
             if message.role == "user":
                 conversation_tokens.append(user_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                # Prepend <|image|> marker if this message has an image
+                content = message.content
+                if message.image and worker.has_vision:
+                    content = f"<|image|>\n{content}"
+                conversation_tokens.extend(worker.tokenizer.encode(content))
                 conversation_tokens.append(user_end)
             elif message.role == "assistant":
                 conversation_tokens.append(assistant_start)
@@ -415,7 +480,8 @@ async def chat_completions(request: ChatRequest):
                     temperature=request.temperature,
                     max_new_tokens=request.max_tokens,
                     top_k=request.top_k,
-                    repetition_penalty=request.repetition_penalty
+                    repetition_penalty=request.repetition_penalty,
+                    vision_embeds=vision_embeds
                 ):
                     # Accumulate response for logging
                     chunk_data = json.loads(chunk.replace("data: ", "").strip())
@@ -443,11 +509,27 @@ async def chat_completions(request: ChatRequest):
 async def health():
     """Health check endpoint."""
     worker_pool = getattr(app.state, 'worker_pool', None)
+    has_vision = worker_pool.workers[0].has_vision if worker_pool and worker_pool.workers else False
     return {
         "status": "ok",
         "ready": worker_pool is not None and len(worker_pool.workers) > 0,
         "num_gpus": worker_pool.num_gpus if worker_pool else 0,
-        "available_workers": worker_pool.available_workers.qsize() if worker_pool else 0
+        "available_workers": worker_pool.available_workers.qsize() if worker_pool else 0,
+        "vision_enabled": has_vision
+    }
+
+@app.get("/vision")
+async def vision_status():
+    """Check if vision capabilities are available."""
+    worker_pool = getattr(app.state, 'worker_pool', None)
+    if not worker_pool or not worker_pool.workers:
+        return {"vision_enabled": False, "reason": "No workers available"}
+
+    worker = worker_pool.workers[0]
+    return {
+        "vision_enabled": worker.has_vision,
+        "encoder": getattr(worker.engine.model.config, 'vision_encoder_name', None) if worker.has_vision else None,
+        "image_size": getattr(worker.engine.model.config, 'vision_image_size', None) if worker.has_vision else None
     }
 
 @app.get("/stats")

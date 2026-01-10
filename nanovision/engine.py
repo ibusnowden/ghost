@@ -15,10 +15,98 @@ import torch
 import torch.nn.functional as F
 import signal
 import warnings
+import hashlib
 from contextlib import contextmanager
-from collections import deque
+from collections import deque, OrderedDict
 from nanochat.common import compute_init
 from nanochat.checkpoint_manager import load_model
+
+
+# -----------------------------------------------------------------------------
+# Vision Embedding Cache for efficient repeated image processing
+
+class VisionEmbeddingCache:
+    """
+    LRU cache for vision embeddings to avoid recomputing for repeated images.
+
+    Since vision encoders are typically frozen, the same image always produces
+    the same embeddings. This cache stores computed embeddings keyed by image hash.
+
+    Usage:
+        cache = VisionEmbeddingCache(max_size=100)
+
+        # Check cache first
+        cache_key = cache.compute_key(image_tensor)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            vision_embeds = cached
+        else:
+            vision_embeds = model.encode_vision(image_tensor)
+            cache.put(cache_key, vision_embeds)
+    """
+
+    def __init__(self, max_size: int = 100, enabled: bool = True):
+        """
+        Args:
+            max_size: Maximum number of embeddings to cache
+            enabled: Whether caching is enabled (can disable for debugging)
+        """
+        self.max_size = max_size
+        self.enabled = enabled
+        self.cache = OrderedDict()  # LRU cache
+        self.hits = 0
+        self.misses = 0
+
+    def compute_key(self, image_tensor: torch.Tensor) -> str:
+        """Compute a hash key for an image tensor."""
+        # Use a fast hash of the tensor data
+        # Convert to bytes and hash - works for any tensor
+        data = image_tensor.cpu().numpy().tobytes()
+        return hashlib.md5(data).hexdigest()
+
+    def get(self, key: str) -> torch.Tensor:
+        """Get cached embedding, returns None if not found."""
+        if not self.enabled:
+            return None
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            self.hits += 1
+            return self.cache[key]
+        self.misses += 1
+        return None
+
+    def put(self, key: str, embedding: torch.Tensor):
+        """Store embedding in cache."""
+        if not self.enabled:
+            return
+        # Clone to ensure we don't hold references to computation graph
+        embedding = embedding.detach().clone()
+
+        # Evict oldest if at capacity
+        if len(self.cache) >= self.max_size:
+            self.cache.popitem(last=False)
+
+        self.cache[key] = embedding
+
+    def clear(self):
+        """Clear the cache."""
+        self.cache.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        total = self.hits + self.misses
+        hit_rate = self.hits / total if total > 0 else 0.0
+        return {
+            "size": len(self.cache),
+            "max_size": self.max_size,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": hit_rate,
+            "enabled": self.enabled,
+        }
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -170,9 +258,50 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, vision_cache_size: int = 100):
         self.model = model
-        self.tokenizer = tokenizer # needed for tool use
+        self.tokenizer = tokenizer  # needed for tool use
+
+        # Vision embedding cache (only useful if model has vision)
+        self.vision_cache = VisionEmbeddingCache(max_size=vision_cache_size)
+
+    def encode_vision_cached(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Encode an image tensor to vision embeddings, using cache if available.
+
+        Args:
+            image_tensor: Preprocessed image tensor [B, 3, H, W] or [1, 3, H, W]
+
+        Returns:
+            vision_embeds: [B, num_vision_tokens, embed_dim]
+        """
+        if not hasattr(self.model, 'encode_vision') or self.model.vision_encoder is None:
+            raise ValueError("Model does not have vision capabilities")
+
+        # For single images, use cache
+        if image_tensor.shape[0] == 1:
+            cache_key = self.vision_cache.compute_key(image_tensor)
+            cached = self.vision_cache.get(cache_key)
+            if cached is not None:
+                return cached.to(image_tensor.device)
+
+            # Compute and cache
+            with torch.no_grad():
+                vision_embeds = self.model.encode_vision(image_tensor)
+            self.vision_cache.put(cache_key, vision_embeds)
+            return vision_embeds
+
+        # For batches, compute directly (caching batches is less useful)
+        with torch.no_grad():
+            return self.model.encode_vision(image_tensor)
+
+    def get_vision_cache_stats(self) -> dict:
+        """Return vision embedding cache statistics."""
+        return self.vision_cache.stats()
+
+    def clear_vision_cache(self):
+        """Clear the vision embedding cache."""
+        self.vision_cache.clear()
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, repetition_penalty=1.0, vision_embeds=None):

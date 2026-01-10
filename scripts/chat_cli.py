@@ -3,9 +3,15 @@ New and upgraded chat mode because a lot of the code has changed since the last 
 
 Intended to be run single GPU only atm:
 python -m scripts.chat_cli -i mid
+
+Image support:
+  /image path/to/image.jpg    - Load an image for the next message
+  /clear                      - Clear conversation and image
 """
 import argparse
+import os
 import torch
+from PIL import Image
 from scripts.backend_utils import (
     build_adamw_all_params,
     init_deepspeed_if_needed,
@@ -15,6 +21,7 @@ from scripts.backend_utils import (
 from nanochat.common import compute_init
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
+from nanovision.vision.transforms import get_vision_transforms
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|mid|rl")
@@ -72,13 +79,26 @@ assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>")
 # Create Engine for efficient generation
 engine = Engine(eval_model, tokenizer)
 
+# Initialize vision support if model has it
+has_vision = hasattr(eval_model, 'encode_vision') and eval_model.vision_encoder is not None
+vision_transforms = None
+if has_vision:
+    encoder_name = getattr(eval_model.config, 'vision_encoder_name', 'siglip_vit_l14')
+    image_size = getattr(eval_model.config, 'vision_image_size', 336)
+    vision_transforms = get_vision_transforms(encoder_name, image_size, is_train=False)
+    print(f"Vision support enabled ({encoder_name}, {image_size}x{image_size})")
+
 print("\nNanoChat Interactive Mode")
 print("-" * 50)
 print("Type 'quit' or 'exit' to end the conversation")
 print("Type 'clear' to start a new conversation")
+if has_vision:
+    print("Type '/image path/to/image' to attach an image")
 print("-" * 50)
 
 conversation_tokens = [bos]
+current_image = None  # PIL Image for next message
+current_vision_embeds = None  # Cached vision embeddings
 
 while True:
 
@@ -100,15 +120,48 @@ while True:
 
     if user_input.lower() == 'clear':
         conversation_tokens = [bos]
+        current_image = None
+        current_vision_embeds = None
         print("Conversation cleared.")
+        continue
+
+    # Handle /image command
+    if user_input.startswith('/image '):
+        if not has_vision:
+            print("This model does not support vision. Load a VLM checkpoint.")
+            continue
+        image_path = user_input[7:].strip()
+        # Expand ~ to home directory
+        image_path = os.path.expanduser(image_path)
+        if not os.path.exists(image_path):
+            print(f"Image not found: {image_path}")
+            continue
+        try:
+            current_image = Image.open(image_path).convert("RGB")
+            # Pre-compute vision embeddings
+            image_tensor = vision_transforms(current_image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                current_vision_embeds = eval_model.encode_vision(image_tensor)
+            print(f"Image loaded: {image_path} ({current_image.size[0]}x{current_image.size[1]})")
+            print("Your next message will include this image.")
+        except Exception as e:
+            print(f"Failed to load image: {e}")
+            current_image = None
+            current_vision_embeds = None
         continue
 
     if not user_input:
         continue
 
     # Add User message to the conversation
+    # If we have an image, prepend <|image|> marker to the message
+    if current_image is not None:
+        user_message = f"<|image|>\n{user_input}"
+    else:
+        user_message = user_input
+
     conversation_tokens.append(user_start)
-    conversation_tokens.extend(tokenizer.encode(user_input))
+    conversation_tokens.extend(tokenizer.encode(user_message))
     conversation_tokens.append(user_end)
 
     # Kick off the assistant
@@ -119,6 +172,11 @@ while True:
         "temperature": args.temperature,
         "top_k": args.top_k,
     }
+
+    # Add vision embeddings if we have an image
+    if current_vision_embeds is not None:
+        generate_kwargs["vision_embeds"] = current_vision_embeds
+
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)
     with autocast_ctx:
@@ -128,6 +186,10 @@ while True:
             token_text = tokenizer.decode([token])
             print(token_text, end="", flush=True)
     print()
+
+    # Clear image after use (one-shot)
+    current_image = None
+    current_vision_embeds = None
     # we have to ensure that the assistant end token is the last token
     # so even if generation ends due to max tokens, we have to append it to the end
     if response_tokens[-1] != assistant_end:

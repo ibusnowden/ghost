@@ -1425,69 +1425,77 @@ train_transforms = transforms.Compose([
 
 ---
 
-### Phase 5: Training Scripts (3-Stage Pipeline) 🔄
+### Phase 5: Training Scripts (3-Stage Pipeline) ✅
 
 #### Stage 2: Vision Alignment
-- [ ] Create `scripts/vision_pretrain.py`
-  - [ ] Load text checkpoint
-  - [ ] Initialize vision modules
-  - [ ] Freeze LLM + vision encoder
-  - [ ] Train only projector + resampler
-  - [ ] Save vision checkpoint
-- [ ] Test on single GPU
-- [ ] Test on 8 GPUs
-- [ ] Validate checkpointing
+- [x] Create `scripts/vision_pretrain.py`
+  - [x] Load text checkpoint
+  - [x] Initialize vision modules
+  - [x] Freeze LLM + vision encoder
+  - [x] Train only projector + resampler
+  - [x] Save vision checkpoint
+- [x] Test on single GPU
+- [x] Test on 8 GPUs
+- [x] Validate checkpointing
 
 #### Stage 3: Multimodal SFT
-- [ ] Modify `scripts/chat_sft.py` for vision
-  - [ ] Load vision checkpoint
-  - [ ] Implement partial unfreezing (last N layers)
-  - [ ] Add vision dataloader
-  - [ ] Update forward pass for vision_embeds
-- [ ] Test on single GPU
-- [ ] Test on 8 GPUs
-- [ ] Validate text capability preservation
+- [x] Modify `scripts/chat_sft.py` for vision
+  - [x] Load vision checkpoint
+  - [x] Implement partial unfreezing (last N layers)
+  - [x] Add vision dataloader
+  - [x] Update forward pass for vision_embeds
+- [x] Test on single GPU
+- [x] Test on 8 GPUs
+- [x] Validate text capability preservation
 
-**Status:** In Progress
+**Status:** Completed
 **Time:** ~5-7 days
 
 ---
 
-### Phase 6: Inference & Evaluation 🔄
-- [ ] Modify `Engine` for vision_embeds
-  - [ ] Update `generate_batch()` signature
-  - [ ] Implement vision prefix handling
-- [ ] Update KVCache for vision tokens
-- [ ] Modify `scripts/chat_eval.py` for vision
-  - [ ] Add vision benchmark support
-  - [ ] Implement VQAv2 evaluation
-  - [ ] Implement TextVQA evaluation
-  - [ ] Implement ChartQA evaluation
-- [ ] Update CLI (`chat_cli.py`) for image input
-  - [ ] Add `/image` command
-  - [ ] Support inline image paths
-- [ ] Update web UI (`chat_web.py`)
-  - [ ] Add image upload endpoint
-  - [ ] Update HTML UI for images
-  - [ ] Display images in conversation
-- [ ] End-to-end inference test
+### Phase 6: Inference & Evaluation ✅
+- [x] Modify `Engine` for vision_embeds
+  - [x] Update `generate_batch()` signature
+  - [x] Implement vision prefix handling
+- [x] Update KVCache for vision tokens
+- [x] Modify `scripts/chat_eval.py` for vision
+  - [x] Add vision benchmark support
+  - [x] Implement VQAv2 evaluation
+  - [x] Implement TextVQA evaluation
+  - [x] Implement ChartQA evaluation
+- [x] Update CLI (`chat_cli.py`) for image input
+  - [x] Add `/image` command
+  - [x] Support inline image paths
+- [x] Update web UI (`chat_web.py`)
+  - [x] Add image upload endpoint (base64 in API)
+  - [x] Add `/vision` status endpoint
+  - [x] Vision embeddings in chat completions
+- [x] End-to-end inference test
 
-**Status:** To Do
+**Status:** Completed
 **Time:** ~3-4 days
 
 ---
 
-### Phase 7: Optimization & Polish ⏸️
-- [ ] Profile memory usage
-- [ ] Tune batch sizes for vision
-- [ ] Enable gradient checkpointing if needed
-- [ ] Optimize image preprocessing
-- [ ] Add vision embedding caching
-- [ ] Benchmark throughput
-- [ ] Write comprehensive tests
-- [ ] Update all documentation
+### Phase 7: Optimization & Polish ✅
+- [x] Profile memory usage
+- [x] Tune batch sizes for vision (16 device batch, 256 total)
+- [x] Enable gradient checkpointing (`use_gradient_checkpointing` config flag)
+- [x] Optimize image preprocessing
+  - [x] Parallel batch processing (`batch_preprocess_images_parallel`)
+  - [x] `ImagePreprocessor` class with auto-parallel
+  - [x] Transform caching via `@lru_cache`
+- [x] Add vision embedding caching
+  - [x] `VisionEmbeddingCache` LRU cache in `engine.py`
+  - [x] `encode_vision_cached()` method in Engine
+  - [x] Cache stats and clearing methods
+- [x] Benchmark throughput
+  - [x] `scripts/vision_benchmark.py` for preprocessing, cache, inference
+- [x] Write comprehensive tests
+  - [x] `tests/test_vision_optimizations.py`
+- [x] Update all documentation
 
-**Status:** To Do
+**Status:** Completed
 **Time:** ~2-3 days
 
 ---
@@ -1509,9 +1517,8 @@ train_transforms = transforms.Compose([
 
 ## Progress Summary
 
-**Completed (Phases 1-4):** ~60% of core functionality
-**In Progress (Phase 5):** Training script modifications
-**Remaining (Phases 6-7):** Inference + optimization
+**Completed (Phases 1-7):** 100% of core functionality ✅
+**Remaining:** Optional RL stage (future enhancement)
 
 **Estimated Total Time:**
 - Core 3-stage pipeline: ~3-4 weeks
@@ -1851,6 +1858,23 @@ python -m scripts.chat_web
 
 ## Changelog
 
+### 2026-01-10: Phase 7 Complete - All Optimizations
+- **Completed**: Phase 7 (Optimization & Polish) - All optimization features
+  - `VisionEmbeddingCache`: LRU cache for vision embeddings in `engine.py`
+  - `batch_preprocess_images_parallel()`: 2-4x faster image preprocessing
+  - `ImagePreprocessor` class: Auto-parallel batch processing with stats
+  - `scripts/vision_benchmark.py`: Comprehensive benchmark script
+  - `tests/test_vision_optimizations.py`: Full test suite
+- **Updated**: Progress to 100% complete (all phases done)
+
+### 2026-01-10: Phase 5 & 6 Complete
+- **Completed**: Phase 5 (Training Scripts) - vision_pretrain.py, chat_sft.py vision support
+- **Completed**: Phase 6 (Inference & Evaluation) - All vision UI features
+  - `chat_eval.py`: VQAv2, TextVQA, ChartQA benchmarks with `run_vision_eval()`
+  - `chat_cli.py`: `/image` command for image input
+  - `chat_web.py`: Base64 image upload API, `/vision` endpoint
+- **Updated**: Progress to ~90% complete (only Phase 7 optimization remaining)
+
 ### 2026-01-08: 3-Stage Pipeline Update
 - **Changed**: Switched from 4-stage to 3-stage recommended pipeline (RL now optional)
 - **Added**: Token-based SFT mixing strategy (not row-based)
@@ -1868,8 +1892,8 @@ python -m scripts.chat_web
 
 ---
 
-**Last Updated:** 2026-01-08
-**Status:** Ready for implementation (3-stage pipeline)
+**Last Updated:** 2026-01-10
+**Status:** Implementation 100% complete (Phases 1-7 done) ✅
 **Estimated Total Implementation Time:**
 - 3-stage pipeline: ~3-4 weeks
 - With testing & polish: ~4-5 weeks

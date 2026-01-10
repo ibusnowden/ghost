@@ -33,6 +33,14 @@ from tasks.math import MATH
 from tasks.bbh import BBH
 from tasks.mbpp import MBPP
 
+# Vision tasks
+from tasks.vqav2 import VQAv2
+from tasks.textvqa import TextVQA
+from tasks.chartqa import ChartQA
+
+# Vision transforms
+from nanovision.vision.transforms import get_vision_transforms, preprocess_image
+
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
@@ -175,12 +183,122 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     }
 
 # -----------------------------------------------------------------------------
+# Vision evaluation loop (handles images in the evaluation)
+
+def run_vision_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+    """
+    Generative evaluation for vision tasks.
+    Processes images through vision encoder and generates text responses.
+    """
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    device = model.get_device()
+
+    # Check if model has vision capabilities
+    has_vision = hasattr(model, 'encode_vision') and model.vision_encoder is not None
+    if not has_vision:
+        print0("WARNING: Model does not have vision capabilities. Running text-only evaluation.")
+
+    # Get vision transforms if model supports vision
+    vision_transforms = None
+    if has_vision:
+        encoder_name = getattr(model.config, 'vision_encoder_name', 'siglip_vit_l14')
+        image_size = getattr(model.config, 'vision_image_size', 336)
+        vision_transforms = get_vision_transforms(encoder_name, image_size, is_train=False)
+
+    num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
+
+    # Run the evaluation
+    pass_any, pass_first, total = 0, 0, 0
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        example = task_object.get_example(i)
+
+        # Extract image and messages
+        image = example.get("image")
+        messages = example.get("messages", [])
+
+        # Build conversation for completion (exclude assistant's answer)
+        conversation = [m for m in messages if m["role"] != "assistant"]
+
+        # Process image if present and model supports vision
+        vision_embeds = None
+        if image is not None and has_vision and vision_transforms is not None:
+            try:
+                # Ensure image is PIL
+                from PIL import Image
+                if not isinstance(image, Image.Image):
+                    image = Image.open(image).convert("RGB") if isinstance(image, str) else image
+
+                # Preprocess and encode
+                image_tensor = vision_transforms(image).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    vision_embeds = model.encode_vision(image_tensor)
+            except Exception as e:
+                print(f"\rWarning: Failed to process image for problem {i}: {e}")
+                vision_embeds = None
+
+        # Tokenize the prompt
+        encoded_prompt = tokenizer.render_for_completion(conversation)
+
+        # Get the completions
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            vision_embeds=vision_embeds,
+            num_samples=num_samples,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        # Decode the completions as text
+        prefix_length = len(encoded_prompt)
+        completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
+
+        # Evaluate success criteria
+        outcomes = [task_object.evaluate(example, completion) for completion in completions]
+        passed_any = any(outcomes)
+        passed_first = outcomes[0] if len(outcomes) > 0 else False
+
+        # Keep stats
+        total += 1
+        pass_any += int(passed_any)
+        pass_first += int(passed_first)
+
+        # Logging (overwrite the same line in the console)
+        print(f"\r\033[KRank {ddp_rank} | pass@k {pass_any}/{total} ({100*pass_any/total:.2f}%) | pass@1 {pass_first}/{total} ({100*pass_first/total:.2f}%)", end='', flush=True)
+
+    # Finish the in-place progress line with a newline before final summary
+    print()
+
+    # Aggregate results across all ranks
+    if ddp:
+        pass_any_tensor = torch.tensor([pass_any], dtype=torch.long, device=device)
+        pass_first_tensor = torch.tensor([pass_first], dtype=torch.long, device=device)
+        total_tensor = torch.tensor([total], dtype=torch.long, device=device)
+        dist.all_reduce(pass_any_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pass_first_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        pass_any = pass_any_tensor.item()
+        pass_first = pass_first_tensor.item()
+        total = total_tensor.item()
+
+    print0("=" * 50)
+    avg_any = pass_any / total if total > 0 else 0.0
+    avg_first = pass_first / total if total > 0 else 0.0
+    print0(f"Final pass@k: {pass_any}/{total} ({100*avg_any:.2f}%) | pass@1: {pass_first}/{total} ({100*avg_first:.2f}%)")
+    return {
+        "acc_pass@k": avg_any,
+        "acc_pass@1": avg_first,
+        "num_problems": total,
+    }
+
+# -----------------------------------------------------------------------------
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None):
     # Create the evaluation object
     task_module = {
+        # Text-only tasks
         'HumanEval': HumanEval,
         'HumanEvalPlus': HumanEvalPlus,
         'MMLU': partial(MMLU, subset="all", split="test"),
@@ -192,10 +310,20 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'MBPP': partial(MBPP, split="test"),
         'GPUCode': GPUCodeEval,
         'GPUCodeGen': GPUCodeGenEval,
+        # Vision tasks
+        'VQAv2': partial(VQAv2, split="val"),
+        'TextVQA': partial(TextVQA, split="val"),
+        'ChartQA': partial(ChartQA, split="val"),
     }[task_name]
     task_object = task_module()
+
+    # Vision tasks use the vision evaluation loop
+    vision_tasks = {'VQAv2', 'TextVQA', 'ChartQA'}
+
     # Run the evaluation
-    if task_object.eval_type == 'generative':
+    if task_name in vision_tasks:
+        acc = run_vision_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+    elif task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
@@ -230,6 +358,7 @@ if __name__ == "__main__":
 
     # Get the tasks to evaluate on
     all_tasks = [
+        # Text-only tasks
         'ARC-Easy',
         'ARC-Challenge',
         'MMLU',
@@ -241,8 +370,13 @@ if __name__ == "__main__":
         'MBPP',
         'GPUCode',
         'GPUCodeGen',
+        # Vision tasks
+        'VQAv2',
+        'TextVQA',
+        'ChartQA',
     ]
     baseline_accuracies = {
+        # Text-only baselines
         'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
         'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%
         'MMLU': 0.25, # multiple choice 1 of 4 => 25%
@@ -254,6 +388,10 @@ if __name__ == "__main__":
         'MBPP': 0.0,
         'GPUCode': 0.0, # GPU concepts understanding => 0%
         'GPUCodeGen': 0.0, # GPU code generation => 0%
+        # Vision baselines (open-ended VQA => 0%)
+        'VQAv2': 0.0,
+        'TextVQA': 0.0,
+        'ChartQA': 0.0,
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
