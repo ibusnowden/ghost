@@ -484,6 +484,10 @@ pip install pytest wandb
 
 ---
 
+## More questions:
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ibusnowden/ghost)
+
 ## Acknowledgements
 
 - Built on [nanochat](https://github.com/karpathy/nanochat) by Andrej Karpathy
